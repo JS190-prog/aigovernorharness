@@ -1,0 +1,38 @@
+{
+  "$schema_note": "Edit this file to register a new natural-language MCP trigger. Restart the ai-governor-harness MCP server to pick up changes — no TypeScript rebuild required. Each entry tells INVARIANT#19_MCP_TRIGGER_BYPASS: when `keywordPattern` matches in a response AND `bypassPattern` matches in the same response (indicating direct REST/CLI access), fire a violation UNLESS the tool_call_log shows `expectedMcpPrefix`. Patterns are compiled with the `i` flag.",
+  "$cross_check_with_mcp_config": "If `mcp_config.json` does not register a server matching `mcpServerName`, that entry is auto-skipped at load time (logged to stderr). This prevents false positives for triggers whose backing server was uninstalled.",
+  "triggers": [
+    {
+      "name": "opencrab",
+      "mcpServerName": "opencrab",
+      "keywordPattern": "(오픈\\s*크랩|opencrab)",
+      "bypassPattern": "(curl\\s+[^\\n]*localhost:8001|query_opencrab\\.py|Invoke-RestMethod[\\s\\S]{0,80}localhost:8001|requests\\.(?:post|get)[\\s\\S]{0,80}localhost:8001|http:\\/\\/localhost:8001\\/api\\/(?:query|ingest|nodes))",
+      "expectedMcpPrefix": "mcp__opencrab__",
+      "description": "OpenCrab keyword requires mcp__opencrab__ontology_query. Direct localhost:8001 REST access is a bypass — only allowed as fallback after the MCP tool itself fails."
+    },
+    {
+      "name": "langfuse",
+      "mcpServerName": "hermes-agent",
+      "keywordPattern": "(langfuse|랭퓨즈)",
+      "bypassPattern": "(curl\\s+[^\\n]*(?:localhost:3000|api\\.langfuse)|Invoke-RestMethod[\\s\\S]{0,80}langfuse|requests\\.(?:post|get)[\\s\\S]{0,80}langfuse|http:\\/\\/localhost:3000\\/api\\/public\\/)",
+      "expectedMcpPrefix": "mcp__hermes",
+      "description": "Langfuse session search must use the hermes-langfuse-search skill (which routes to mcp__hermes-agent__hermes_session_search) or scripts/search.py — never direct REST."
+    },
+    {
+      "name": "korean_law",
+      "mcpServerName": "korean-law",
+      "keywordPattern": "(국가법령|한국법령|국토의\\s*계획|건축법|시행령|판례\\s*검색|법령\\s*조회|korean.{0,3}law)",
+      "bypassPattern": "(curl\\s+[^\\n]*(?:law\\.go\\.kr|open\\.law)|requests\\.(?:post|get)[\\s\\S]{0,80}law\\.go\\.kr|Invoke-RestMethod[\\s\\S]{0,80}law\\.go\\.kr)",
+      "expectedMcpPrefix": "mcp__korean-law__",
+      "description": "Korean-law queries must go through mcp__korean-law__ tools (search_law / get_law_text / verify_citations). Direct law.go.kr scraping bypasses citation verification."
+    },
+    {
+      "name": "notebooklm",
+      "mcpServerName": "notebooklm",
+      "keywordPattern": "(notebook\\s*lm|노트북\\s*lm)",
+      "bypassPattern": "(curl\\s+[^\\n]*notebooklm\\.google|nlm\\s+(?:query|chat)\\b|requests\\.(?:post|get)[\\s\\S]{0,80}notebooklm)",
+      "expectedMcpPrefix": "mcp__notebooklm__",
+      "description": "NotebookLM access must use mcp__notebooklm__ tools. The `nlm` CLI is the auth helper — direct query/chat CLI usage skips the MCP layer."
+    }
+  ]
+}

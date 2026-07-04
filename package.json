@@ -1,0 +1,27 @@
+{
+  "name": "aigovernorharness",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "test": "pnpm build && node scripts/mcp-smoke.mjs && node scripts/mcp-regression.mjs",
+    "corpus:build": "node scripts/build-langfuse-incident-corpus.mjs --limit 100 --max-per-rule 40",
+    "corpus:test": "pnpm build && node scripts/corpus-regression.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.20.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  }
+}

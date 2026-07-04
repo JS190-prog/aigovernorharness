@@ -1,0 +1,45 @@
+[
+  {
+    "_comment": "2026-06-11 trace 48ad4493 — 워처 generated-routes.json 에 누락되어 INVARIANT#25 미발동. 네이버 블로그 발행/임시저장 요청은 hermes-naver-publish SKILL.md 선행 필수.",
+    "keywords": [
+      "네이버 블로그 작성",
+      "네이버 블로그 글쓰기",
+      "네이버에 글 써줘",
+      "네이버에 작성해줘",
+      "네이버에 임시저장",
+      "네이버 블로그 초안",
+      "네이버에 저장해줘",
+      "네이버 블로그 자동 업로드",
+      "네이버에 올려줘",
+      "네이버 임시저장"
+    ],
+    "skills": ["hermes-naver-publish"]
+  },
+  {
+    "_comment": "2026-06-11 trace 48ad4493 — 블로그/리뷰 산출물 저장 후 캡션 검증 스킬이 라우팅되지 않아 캡션 환각이 통과. 검증 요청 키워드를 하네스가 직접 보장.",
+    "keywords": [
+      "사진 캡션 맞아",
+      "리뷰 검증",
+      "블로그 검증",
+      "blog verify",
+      "영수증 OCR 검증",
+      "캡션 환각",
+      "사진이랑 본문 맞는지"
+    ],
+    "skills": ["hermes-blog-verify"]
+  },
+  {
+    "_comment": "2026-06-20 나은이네 이미지 사건 — 일러스트 관련 요청 시 hermes-illustration-expert SKILL.md 선행 필수. 스킬은 generate_image 도구 + ImagePaths 사용을 강제하며 cv2/OpenCV 구현을 금지한다.",
+    "keywords": [
+      "일러스트",
+      "일러스트로",
+      "일러스트 변환",
+      "일러스트 스타일",
+      "illustration",
+      "사진 일러스트",
+      "이미지 일러스트",
+      "그림체 변환"
+    ],
+    "skills": ["hermes-illustration-expert"]
+  }
+]
