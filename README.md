@@ -161,4 +161,4 @@ git status --short
 
 ## 라이선스
 
-ISC
+MIT

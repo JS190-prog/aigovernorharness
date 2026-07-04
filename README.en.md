@@ -170,4 +170,4 @@ or raw exported incident corpora.
 
 ## License
 
-ISC
+MIT
