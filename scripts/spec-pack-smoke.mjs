@@ -9,11 +9,20 @@ const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "spec-pack-smoke-"));
 const PACK_ROOT = path.join(TEST_ROOT, "pack");
 const UPLOAD_DIR = path.join(TEST_ROOT, "upload");
 
+// spec_pack_audit shells out to an external pack_audit.py. When the real
+// hermes-spec-pack-prep script isn't installed (CI, fresh clone), fall back to
+// the in-repo fixture that implements the same CLI contract, so this suite runs
+// anywhere Python is available. An explicit SPEC_PACK_AUDIT_PY still wins.
+const FIXTURE_AUDIT = path.resolve("testdata/fixtures/pack_audit_stub.py");
+const env = { ...process.env };
+if (!env.SPEC_PACK_AUDIT_PY) env.SPEC_PACK_AUDIT_PY = FIXTURE_AUDIT;
+
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: ["build/index.js"],
   cwd: process.cwd(),
   stderr: "pipe",
+  env,
 });
 const client = new Client({ name: "spec-pack-smoke", version: "1.0.0" });
 

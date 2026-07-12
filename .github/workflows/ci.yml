@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The regression suite's skill-first (INVARIANT#25) and skill-install
+      # cases expect a known set of skills on disk plus a transcription route
+      # that the author's sync watcher normally supplies. A clean runner has
+      # neither, so seed deterministic fixtures and export the two env vars the
+      # harness reads (HARNESS_SKILL_ROOTS / HARNESS_SKILL_ROUTES_CONFIG).
+      - name: Seed skill fixtures
+        shell: bash
+        run: node scripts/ci-seed-fixtures.mjs "${RUNNER_TEMP}/harness-fixtures" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: pnpm test
+
+  spec-pack:
+    # spec_pack_audit shells out to an external pack_audit.py. The real
+    # hermes-spec-pack-prep script isn't vendored here, so spec-pack-smoke falls
+    # back to the in-repo fixture (testdata/fixtures/pack_audit_stub.py), which
+    # implements the same CLI contract. That exercises the TypeScript wrapper
+    # (arg passing, JSON parsing, verdict/token surfacing, INVARIANT#23 evidence)
+    # on every push. Point SPEC_PACK_AUDIT_PY at the real script to test it too.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pnpm install --frozen-lockfile
+      - name: Spec-pack smoke
+        env:
+          SPEC_PACK_AUDIT_PY: ${{ vars.SPEC_PACK_AUDIT_PY }}
+        run: pnpm run test:spec

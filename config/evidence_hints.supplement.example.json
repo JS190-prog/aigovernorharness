@@ -1,0 +1,9 @@
+{
+  "$note": "Optional per-deployment evidence-hint supplement. Copy to evidence_hints.supplement.json (gitignored) or point HARNESS_EVIDENCE_HINTS_CONFIG at your own file. Each value is an array of extra hint strings appended to that rule's built-in EVIDENCE_HINTS (de-duplicated). Use this to inject environment-specific commands/paths so they stay out of the shipped source.",
+  "INVARIANT#30_FABRICATED_DIARIZATION": [
+    "구체 실행 명령: `<path-to-venv>/python <path-to>/transcribe_meeting.py <audio> --domain <domain>` 를 실행하고 그 stdout을 인용하세요."
+  ],
+  "INVARIANT#31_CPU_DEVICE_OVERRIDE": [
+    "구체 확인 명령: `<path-to-venv>/python -c \"import torch; print(torch.cuda.is_available())\"`."
+  ]
+}

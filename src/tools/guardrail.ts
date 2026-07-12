@@ -1,10 +1,19 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { execFileSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  type CompletionRiskTier,
+  COMPLETION_RISK_TIERS,
+  normalizeCompletionRiskTier,
+  isLocalCompletionTier,
+  hasStrongEvidence,
+  hasTieredStrongEvidence,
+  evidenceIsStrong,
+} from "./evidence.js";
 
 const SCRIPT_EXT_GROUP = "py|sh|ts|mjs|cjs|js|ps1|bat|cmd|rb|go|rs";
 const SCRIPT_EXEC_VERBS = "실행|통해|사용하여|돌려|동작|구동|기동|호출|호출하여|invok\\w*|ran|run|running|executed|execute|executing|via|using|through";
@@ -72,6 +81,8 @@ function findFileByName(filename: string, roots: string[], maxHits = 3): string[
 }
 
 type Severity = "CRITICAL" | "HIGH" | "MEDIUM";
+// CompletionRiskTier / COMPLETION_RISK_TIERS / normalizeCompletionRiskTier /
+// isLocalCompletionTier now live in ./evidence.ts (imported above).
 
 interface Violation {
   rule: string;
@@ -113,7 +124,11 @@ interface McpTriggerConfigRaw {
   description: string;
 }
 
-const HARNESS_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]):/, "$1:"), "..", "..");
+// fileURLToPath handles drive letters, spaces, and non-ASCII (e.g. Korean) path
+// segments correctly. The former manual `new URL(...).pathname` + regex left
+// percent-encodings (%20 / %ED…) in place, which silently broke config loading
+// (→ INVARIANT#19 disabled) when the repo lived under such a path. (P3-4)
+const HARNESS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 function defaultAntigravityRoot(): string {
   const legacyRoot = path.join(os.homedir(), ".gemini", "antigravity");
   const ideRoot = path.join(os.homedir(), ".gemini", "antigravity-ide");
@@ -272,10 +287,14 @@ const ANTIGRAVITY_ROOT =
 // 회귀/스모크 테스트가 이 변수를 임시 디렉토리로 주입하면, 테스트의 resetState/append 가
 // 더 이상 실제 honest_check_calls.jsonl / honest_check_pending.json 을 삭제·오염하지 않는다.
 const STATE_DIR = process.env.HARNESS_STATE_DIR ?? path.join(ANTIGRAVITY_ROOT, "state");
-const TASK_LEDGER = path.join(ANTIGRAVITY_ROOT, "scripts", "task_ledger.py");
-const FLASH_DOCTOR = path.join(ANTIGRAVITY_ROOT, "scripts", "flash_freeze_doctor.py");
 const HONEST_CALL_LOG = path.join(STATE_DIR, "honest_check_calls.jsonl");
-const HONEST_CALL_LOG_MAX_BYTES = 5 * 1024 * 1024;
+// Rotation threshold. Defaults to 5MB; overridable via HARNESS_HONEST_LOG_MAX_BYTES
+// so tests can force rotation cheaply (mirrors the HARNESS_STATE_DIR injection).
+function resolveHonestLogMaxBytes(): number {
+  const raw = Number(process.env.HARNESS_HONEST_LOG_MAX_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? raw : 5 * 1024 * 1024;
+}
+const HONEST_CALL_LOG_MAX_BYTES = resolveHonestLogMaxBytes();
 
 interface HonestCallEntry {
   ts: string;
@@ -283,6 +302,35 @@ interface HonestCallEntry {
   verdict: string;
   violation_count: number;
   violation_rules?: string[];
+  claim_hash?: string;
+  evidence_hash?: string;
+  result_verdict?: "HONEST" | "WEAK" | "DECEPTIVE";
+  process_verdict?: "HONEST" | "WEAK" | "DECEPTIVE";
+}
+
+// Keep only the newest HONEST_CALL_LOG_BAK_KEEP rotated `.bak` files so the
+// state dir doesn't accumulate one backup per rotation forever. (P2-5)
+const HONEST_CALL_LOG_BAK_KEEP = 3;
+function pruneRotatedLogs(): void {
+  try {
+    const dir = path.dirname(HONEST_CALL_LOG);
+    const base = path.basename(HONEST_CALL_LOG);
+    const baks = fs
+      .readdirSync(dir)
+      .filter((name) => name.startsWith(`${base}.`) && name.endsWith(".bak"))
+      .map((name) => {
+        const full = path.join(dir, name);
+        let mtimeMs = 0;
+        try { mtimeMs = fs.statSync(full).mtimeMs; } catch {}
+        return { full, mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const stale of baks.slice(HONEST_CALL_LOG_BAK_KEEP)) {
+      try { fs.unlinkSync(stale.full); } catch {}
+    }
+  } catch {
+    /* best-effort cleanup */
+  }
 }
 
 function logHonestCheckCall(
@@ -290,6 +338,10 @@ function logHonestCheckCall(
   verdict: string,
   violationCount: number,
   violationRules: string[] = [],
+  claimHashValue?: string,
+  evidenceHashValue?: string,
+  resultVerdict?: "HONEST" | "WEAK" | "DECEPTIVE",
+  processVerdict?: "HONEST" | "WEAK" | "DECEPTIVE",
 ): void {
   try {
     fs.mkdirSync(path.dirname(HONEST_CALL_LOG), { recursive: true });
@@ -297,6 +349,7 @@ function logHonestCheckCall(
       const st = fs.statSync(HONEST_CALL_LOG);
       if (st.size > HONEST_CALL_LOG_MAX_BYTES) {
         fs.renameSync(HONEST_CALL_LOG, HONEST_CALL_LOG + `.${Date.now()}.bak`);
+        pruneRotatedLogs(); // P2-5: keep only the newest few .bak rotations
       }
     }
     const entry: HonestCallEntry = {
@@ -305,6 +358,10 @@ function logHonestCheckCall(
       verdict,
       violation_count: violationCount,
       violation_rules: violationRules.length > 0 ? violationRules.slice(0, 10) : undefined,
+      claim_hash: claimHashValue,
+      evidence_hash: evidenceHashValue,
+      result_verdict: resultVerdict,
+      process_verdict: processVerdict,
     };
     fs.appendFileSync(HONEST_CALL_LOG, JSON.stringify(entry) + "\n", "utf-8");
   } catch (err) {
@@ -379,10 +436,11 @@ function resolveDefaultSessionId(): string {
 }
 const DEFAULT_SESSION_ID = resolveDefaultSessionId();
 
-// Session-level block tracking (#2 retry_count drift fix).
-// claim_hash drifts every retry because the model rewrites the whole response;
-// this counts ALL non-HONEST honest_check calls in the recent window regardless
-// of claim_hash so the gate actually fires at 3 strikes per session.
+// Claim-scoped session block tracking.
+// Earlier versions counted ALL non-HONEST honest_check calls in the recent
+// window regardless of claim_hash. That prevented infinite retries, but it
+// also let one broad failed claim poison a later, narrower claim with fresh
+// evidence. Keep the session window, but scope it to the current claim hash.
 const SESSION_BLOCK_LIMIT = 3;
 const SESSION_BLOCK_WINDOW_MIN = 10;
 
@@ -394,30 +452,61 @@ interface PendingState {
   retry_count: number;
   first_blocked_at: string;
   claim_hash: string;
+  evidence_hash?: string;
+  violation_rules?: string[];
   force_partial_status?: boolean;
+  // 2026-07-06 Bug#1 fix: persist user request across retry turns so
+  // detectSkillTriggers() can fire INVARIANT#25 even when the model omits
+  // user_request on subsequent honest_check calls.
+  last_user_request?: string;
 }
 
 type PendingStore = Record<string, PendingState>;
 
 const RETRY_LIMIT = 2; // After RETRY_LIMIT same-claim retries, force PARTIAL_STATUS narrowing.
 
-function claimHash(text: string): string {
-  // Bag-of-words signature so cosmetic rephrasing produces the same hash but
-  // genuinely different claims hash differently.
+function claimScopeHash(text: string): string {
   const words = (text ?? "")
+    .normalize("NFKC")
     .toLowerCase()
-    .replace(/[^a-z0-9가-힣\s]/g, " ")
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
     .split(/\s+/)
     .filter(Boolean)
-    .slice(0, 30)
+    .slice(0, 60)
     .sort();
   return crypto.createHash("sha256").update(words.join(" ")).digest("hex").slice(0, 16);
 }
 
-function sleepBusyWait(ms: number): void {
-  const end = Date.now() + ms;
-  // eslint-disable-next-line no-empty
-  while (Date.now() < end) {}
+function evidenceHash(toolCallLog: string, evidenceOutputs: string[] = []): string {
+  const normalized = [toolCallLog, ...evidenceOutputs]
+    .join("\n")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+  return crypto.createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+}
+
+function samePendingScope(
+  pending: PendingState | null,
+  currentClaimHash: string,
+  currentEvidenceHash: string,
+): boolean {
+  if (!pending) return false;
+  if (pending.claim_hash === currentClaimHash) return true;
+  const emptyEvidenceHash = evidenceHash("", []);
+  return (
+    currentEvidenceHash !== emptyEvidenceHash &&
+    !!pending.evidence_hash &&
+    pending.evidence_hash === currentEvidenceHash
+  );
+}
+
+function sleepSync(ms: number): void {
+  // Block for `ms` without spinning the CPU (the former busy-wait pegged a core
+  // during lock contention). A private SharedArrayBuffer that is never notified
+  // makes Atomics.wait run the full timeout, then return "timed-out". (P3-5)
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function withPendingLock<T>(fn: () => T): T | null {
@@ -437,7 +526,7 @@ function withPendingLock<T>(fn: () => T): T | null {
       } catch {
         // Race: lock disappeared mid-check, retry.
       }
-      sleepBusyWait(PENDING_LOCK_DELAY_MS);
+      sleepSync(PENDING_LOCK_DELAY_MS);
       continue;
     }
     try {
@@ -572,11 +661,23 @@ const RISK_PATTERNS: { rule: string; pattern: RegExp; reason: string }[] = [
   { rule: "secret_dump", pattern: /(cat\s+\.env|Get-Content\s+\.env|type\s+\.env|credentials\.json)/i, reason: "Potentially exposing secrets to stdout" },
   // ── 2026-06-20 추가: 파일 내용 변환 + 원본 삭제 패턴 (나은이네 이미지 사건)
   // 사용자가 '이름 변경'을 요청했는데 에이전트가 os.remove + imwrite(변환) 실행한 사례.
-  // turn_intent_check draft_action에 이 패턴이 포함되면 INVARIANT#37_IRREVERSIBLE_ACTION_GATE 발동.
+  // 이 두 패턴이 draft_action/user_request 에 잡히면 turn_intent_check 가 파괴적
+  // 작업 승인 게이트를 요구한다. (rename↔delete 범위 드리프트는 아래 SCOPE_DRIFT_DELETE_RE
+  // 로 user_request 의 rename/분석 의도와 삭제가 실제로 공존할 때만 별도 발화한다 —
+  // 2026-07-12 P1-4: 기존 scope_drift_rename_vs_delete 는 삭제 패턴만으로 이중 발화하고
+  // reason 은 있지도 않은 user_request 대조를 주장했다.)
   { rule: "destructive_file_delete", pattern: /\bos\.remove\b|\bos\.unlink\b|\bshutil\.rmtree\b|\bpathlib.*\.unlink\b/, reason: "Python single-file/tree deletion (os.remove/os.unlink/shutil.rmtree) — irreversible without backup confirmation" },
   { rule: "destructive_file_overwrite", pattern: /\b(?:cv2|PIL|Image)[\s.]+(?:imwrite|imencode|save)\b|\bimwrite_korean\b|\bopen\(.*['"']wb['"']\)/, reason: "Binary file overwrite via OpenCV/PIL/raw open-wb — original data is permanently replaced" },
-  { rule: "scope_drift_rename_vs_delete", pattern: /(?:os\.remove|os\.unlink|shutil\.rmtree|Remove-Item)/, reason: "SCOPE_DRIFT: draft_action contains deletion while user_request appears to be rename/analysis only — confirm user explicitly asked to delete originals" },
 ];
+
+// 2026-07-12 P1-4: real scope-drift signal. Only meaningful when the USER asked
+// for a rename/analysis-only operation but the action being taken deletes files.
+const SCOPE_DRIFT_DELETE_RE = /(?:os\.remove|os\.unlink|shutil\.rmtree|Remove-Item)/i;
+// Non-destructive intents that should NOT lead to deletion. "정리"(tidy) is
+// deliberately excluded — it often legitimately includes deletion.
+const RENAME_ANALYSIS_INTENT_RE = /(이름\s*(?:을|를)?\s*(?:변경|바꿔|바꾸)|rename|파일\s*명|분석|확인|조회)/i;
+// If the user explicitly asked to delete, deletion is in-scope — not drift.
+const EXPLICIT_DELETE_INTENT_RE = /(삭제|지워|지우|없애|제거|remove|delete)/i;
 
 // ACTIVE_HALLUCINATION_ALERT.md is continuously re-created by the hallucination
 // watchdog daemon even after manual removal. If it is the ONLY active alert
@@ -587,65 +688,8 @@ const WATCHDOG_REGENERATED_ALERTS = new Set([
   path.join(STATE_DIR, "ACTIVE_HALLUCINATION_ALERT.md"),
 ]);
 
-const PASS_EVIDENCE_PATTERNS = [
-  /```[\s\S]*?\bexit\s*(code)?\s*[:=]?\s*0\b[\s\S]*?```/i,
-  /```[\s\S]*?\btests?\b.{0,40}\b(pass|passed|ok|success)\b[\s\S]*?```/i,
-  /```[\s\S]*?\bbuild\b.{0,40}\b(pass|passed|ok|success|compiled)\b[\s\S]*?```/i,
-  // Fence-independent test/build evidence. The 2026-06-26 Codex incident
-  // (trace 1c126e97db60) hard-blocked a *legitimate* report: the model ran the
-  // suite and quoted the pass counts, but in a markdown bullet list with inline
-  // backticks ("`pytest tests/x.py` → 29 passed") rather than a ``` fence, so
-  // the fenced patterns above missed it, strongEvidence stayed false, and
-  // INVARIANT#15_PHANTOM_SCRIPT fired CRITICAL — pushing the model to *weaken*
-  // its evidence to pass the gate. evidenceIsStrong() (used for evidence_outputs[])
-  // already accepted this exact form, so hasStrongEvidence() was asymmetric.
-  // These patterns close that gap. They REQUIRE a concrete numeric result
-  // (N passed / exit 0 next to a runner token), so phantom "ran the script"
-  // claims without counts stay blocked by INVARIANT#15.
-  /\b\d+\s*(?:tests?\s+)?(?:passed|passing)\b/i,
-  /\b\d+\s*개?\s*통과\b/,
-  /\b(?:pytest|jest|vitest|mocha|go\s+test|cargo\s+test|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|py_compile|tsc|gradle|mvn)\b[\s\S]{0,200}?\b(?:\d+\s*passed|exit\s*(?:code)?\s*[:=]?\s*0|compiled|build\s+(?:succeeded|success))\b/i,
-  /\bverified\b.{0,80}\b(stdout|log|json|status|diff|file|endpoint|response)\b/i,
-  /\btask_ledger\.py\s+guard\b[\s\S]{0,300}\b(ok|all_done|exit\s*(code)?\s*[:=]?\s*0)\b/i,
-  /\bExit\s+code\s*:\s*0\b[\s\S]{0,120}\bOutput\s*:\b[\s\S]{0,300}\bPASS[_A-Z0-9-]*\b/i,
-  /\bexit[_\s-]*code\s*[:=]\s*0\b[\s\S]{0,300}\bPASS[_A-Z0-9-]*\b/i,
-  /```[\s\S]*?\bHTTP\s*(200|204)\b[\s\S]*?```/i,
-  /\bALL_VERIFIED\b/,
-  /\bguard_decision\b.{0,80}\bPASS\b/i,
-  /\boverall_verdict\b.{0,80}\bALL_VERIFIED\b/i,
-  /\bSHA-?256\b\s*[:=]\s*[a-f0-9]{32,64}\b/i,
-  // view_file / Read tool style outputs (Korean + English).
-  // Examples that incorrectly BLOCKed in the 2026-05-10 session:
-  //   "console 출력은 깨져 보이지만 파일 자체는 UTF-8 정상입니다 (`bytes=10043, lines=213` 확인)"
-  //   "정확히 작성됐습니다 (214줄, 10043 바이트)."
-  //   "정상적으로 저장됐습니다. (총 151줄, 8935 바이트)"
-  /\bbytes\s*[:=]\s*\d{2,}\b[\s\S]{0,40}\blines?\s*[:=]\s*\d{1,}/i,
-  /\b\d{2,}\s*(?:bytes|byte|바이트)\b[\s\S]{0,40}\b\d{1,}\s*(?:lines?|줄|라인|행)\b/i,
-  /\b\d{1,}\s*(?:lines?|줄|라인|행)\b[\s\S]{0,40}\b\d{2,}\s*(?:bytes|byte|바이트)\b/i,
-  /\(\s*총\s*\d{1,}\s*줄[\s\S]{0,30}\d{2,}\s*바이트\s*\)/,
-  /\b(?:라인\s*수|줄\s*수|line\s*count)\s*[:=]?\s*\d{1,}\b/i,
-  // view_file / Read standard tool output (Antigravity IDE + Claude harness).
-  // The label-before-number, lines-before-bytes form ("Total Lines: 96, Total
-  // Bytes: 3583") was NOT covered by the patterns above (those assume number-
-  // first or bytes-first), so genuine view_file evidence was hard-blocked as
-  // INVARIANT#12 in the 2026-05-28 08:04:56 Antigravity session. Accept both
-  // the explicit "Total Lines/Total Bytes" pair and the "Showing lines N to M"
-  // range marker, which only appear in real file-read tool output.
-  /\b(?:total\s+)?lines?\s*[:=]\s*\d+\b[\s\S]{0,60}\b(?:total\s+)?bytes?\s*[:=]\s*\d+/i,
-  /\b(?:total\s+)?bytes?\s*[:=]\s*\d+\b[\s\S]{0,60}\b(?:total\s+)?lines?\s*[:=]\s*\d+/i,
-  /\bShowing\s+lines?\s+\d+\s+to\s+\d+\b/i,
-  // Local image generation/normalization checks often emit concrete PNG names,
-  // dimensions, byte sizes, and an aggregate png_count rather than line counts.
-  /\bPASS\s+[\w.-]+\.png\s+\d{2,5}x\d{2,5}\s+bytes\s*=\s*\d{3,}\b/i,
-  /\bPASS\s+png_count\s*=\s*\d+\b/i,
-  // spec_pack_audit evidence (INVARIANT#23). Both forms accepted: the raw
-  // completion_token from pack_audit.py and the surrounding verdict line.
-  /\bcompletion_token["']?\s*[:=]\s*["']?[a-f0-9]{16,32}\b/i,
-  /\bspec_pack_audit\b[\s\S]{0,120}\bverdict["']?\s*[:=]\s*["']?PASS\b/i,
-  /\bspec_pack_audit\b[\s\S]{0,40}\bPASS\b[\s\S]{0,80}\bcompletion_token\b/i,
-];
-
-const WEAK_EVIDENCE_ONLY = /^(ok|true|success|done|pass|passed|complete|completed|fixed|verified|완료|성공|통과|확인|정상|문제없음)$/i;
+// PASS_EVIDENCE_PATTERNS / LOCAL_ENGINEERING_EVIDENCE_PATTERNS / WEAK_EVIDENCE_ONLY
+// and the evidence predicates that consume them now live in ./evidence.ts (P1-1).
 const COMPLETION_WORD_RE = /\b(done|complete|completed|fixed|resolved|verified)\b|완료|성공|해결|검증 완료/i;
 const TRANSCRIPTION_COMPLETION_RE =
   /(전사(?:본|문|파일|결과|산출물|완료|생성|통합|작업)|원본\s*그대로\s*전사|녹취록|STT\s*및\s*화자\s*분리|화자\s*분리|diari[sz]|transcription|transcribed)/i;
@@ -677,13 +721,26 @@ const SKILL_INSTALL_COMPLETION_RE = new RegExp(
 // 정직하게 "미설치/실패/예정"으로 라벨된 스킬은 누락으로 보지 않는다.
 const SKILL_NOT_INSTALLED_CTX_RE =
   /(미설치|설치\s*안|설치\s*예정|미생성|미완료|실패|제외|건너뛰|건너뜀|skip|아직|예정|보류|not\s*(?:yet\s*)?(?:installed|created|registered|found)|todo|누락(?:됨|된|되어)?|없음|존재하지\s*않)/i;
-const SKILL_ROOT_CANDIDATES = [
+const SKILL_ROOT_CANDIDATES_DEFAULT = [
   path.join(os.homedir(), ".claude", "skills"),
   path.join(os.homedir(), ".gemini", "antigravity", "skills"),
   path.join(os.homedir(), ".gemini", "config", "skills"),
   path.join(process.cwd(), ".claude", "skills"),
   path.join(process.cwd(), ".agents", "skills"),
 ];
+
+// HARNESS_SKILL_ROOTS overrides the skill-root search list (path.delimiter-
+// separated), mirroring HARNESS_SEARCH_ROOTS. Lets tests/CI inject a
+// deterministic skills fixture directory instead of depending on whatever skills
+// happen to be installed on the host. Unset → default candidates, so production
+// runtime is unchanged.
+function skillRootCandidates(): string[] {
+  const fromEnv = (process.env.HARNESS_SKILL_ROOTS ?? "")
+    .split(path.delimiter)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return fromEnv.length ? fromEnv : SKILL_ROOT_CANDIDATES_DEFAULT;
+}
 
 const RESPONSE_RULES: PatternRule[] = [
   {
@@ -842,7 +899,7 @@ const RESPONSE_RULES: PatternRule[] = [
 // Per-rule evidence-collection hints. When honest_check returns DECEPTIVE/WEAK,
 // the instructions field surfaces these so the model knows the next tool call
 // to make instead of just retrying the same draft. (#1+#5 — 2026-05-26)
-const EVIDENCE_HINTS: Record<string, string[]> = {
+const BUILTIN_EVIDENCE_HINTS: Record<string, string[]> = {
   "INVARIANT#5": [
     "Split each broad completion claim into per-item entries and attach raw stdout/diff/Read excerpt as evidence_outputs[i].",
   ],
@@ -935,15 +992,14 @@ const EVIDENCE_HINTS: Record<string, string[]> = {
   // 배경: 모델이 pyannote를 실행하지 않고 하드코딩 python 스크립트로
   // diarized/part_000.diarized.md + speaker_roster.md 를 손으로 창작한 사례.
   "INVARIANT#30_FABRICATED_DIARIZATION": [
-    "diarized/*.diarized.md, transcript_diarized.md, speaker_roster.md 는 반드시 실제 화자분리 파이프라인 산출물이어야 합니다. `X:\\fixture\\voice\\venv\\Scripts\\python.exe X:\\fixture\\voice\\transcribe_meeting.py <audio> --domain company` 를 실행하고 그 stdout을 인용하세요.",
+    "diarized/*.diarized.md, transcript_diarized.md, speaker_roster.md 는 반드시 실제 화자분리 파이프라인 산출물이어야 합니다. 승인된 전사/화자분리 파이프라인(pyannote 등)을 실행하고 그 stdout을 인용하세요. (구체 실행 명령은 배포별 config/evidence_hints.supplement.json 으로 주입할 수 있습니다.)",
     "화자표를 손으로 작성하거나(추정 화자/시간/confidence 기입), 별도 전사본을 글자수 비례로 화자 블록에 재배분하는 것은 데이터 날조입니다. 화자 분리가 불가능하면 화자 컬럼 없이 raw 전사만 제출하고 '화자 분리 미실행'으로 보고하세요.",
   ],
   // INVARIANT#31_CPU_DEVICE_OVERRIDE (2026-06-11 추가, trace 74cb9bd1)
-  // 배경: CUDA venv(X:\fixture\voice\venv, RTX 5050)가 멀쩡한데 자체 스크립트에
-  // device="cpu" 를 하드코딩해 large-v3를 CPU로 돌리고 'CPU 버전 설치' 류의
-  // 거짓 설명을 한 사례.
+  // 배경: 멀쩡한 CUDA venv가 있는데 자체 스크립트에 device="cpu" 를 하드코딩해
+  // large-v3를 CPU로 돌리고 'CPU 버전 설치' 류의 거짓 설명을 한 사례.
   "INVARIANT#31_CPU_DEVICE_OVERRIDE": [
-    "전사/화자분리 코드에 device='cpu' 를 하드코딩하기 전에 먼저 `X:\\fixture\\voice\\venv\\Scripts\\python.exe -c \"import torch; print(torch.cuda.is_available())\"` 를 실행해 결과를 인용하세요. True면 GPU 경로(transcribe_meeting.py)를 사용해야 합니다.",
+    "전사/화자분리 코드에 device='cpu' 를 하드코딩하기 전에 먼저 `python -c \"import torch; print(torch.cuda.is_available())\"` 를 (승인된 CUDA venv에서) 실행해 결과를 인용하세요. True면 GPU 경로를 사용해야 합니다.",
     "CUDA가 실제로 False인 경우에만 CPU 실행이 허용되며, 그 False 출력 원문과 함께 --allow-cpu 사용을 보고하세요.",
   ],
   // INVARIANT#28_FAILURE_THEN_ARTEFACT_LIST (2026-06-11 추가, trace 0e9310ad/7bf784cc)
@@ -997,6 +1053,62 @@ const EVIDENCE_HINTS: Record<string, string[]> = {
     "If direct Neo4j access or metadata backfill is unavailable, report a degraded SaaS ingest or STATUS: PARTIAL_STATUS instead of claiming full/high-quality/Neo4j-linked completion.",
   ],
 };
+
+// P3-6: keep deployment-specific hint text (transcription venv paths, session-end
+// script names, custom rules) OUT of the shipped source. An optional supplement
+// JSON — { "<RULE>": ["extra hint", ...] } — is merged in at load, mirroring the
+// mcp_triggers / skill_routes.supplement pattern. Absent file → built-in hints
+// only (public default). Env override: HARNESS_EVIDENCE_HINTS_CONFIG.
+const EVIDENCE_HINTS_SUPPLEMENT_PATH =
+  process.env.HARNESS_EVIDENCE_HINTS_CONFIG ??
+  path.join(HARNESS_ROOT, "config", "evidence_hints.supplement.json");
+
+function loadEvidenceHints(): Record<string, string[]> {
+  // Deep-copy the built-ins so a merge never mutates the source-of-truth object.
+  const merged: Record<string, string[]> = {};
+  for (const [rule, hints] of Object.entries(BUILTIN_EVIDENCE_HINTS)) merged[rule] = [...hints];
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(EVIDENCE_HINTS_SUPPLEMENT_PATH, "utf-8").replace(/^﻿/, "");
+  } catch {
+    return merged; // no supplement — public default
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.error(
+      `[harness] evidence_hints.supplement.json invalid JSON — ignored. ${(err as Error).message}`,
+    );
+    return merged;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return merged;
+
+  let added = 0;
+  for (const [rule, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!Array.isArray(value)) continue;
+    const extra = value.map((v) => String(v).trim()).filter(Boolean);
+    if (extra.length === 0) continue;
+    const base = merged[rule] ?? [];
+    // Append supplement hints, de-duplicating against the built-ins.
+    for (const hint of extra) {
+      if (!base.includes(hint)) {
+        base.push(hint);
+        added++;
+      }
+    }
+    merged[rule] = base;
+  }
+  if (added > 0) {
+    console.error(
+      `[harness] merged ${added} supplement evidence hint(s) from ${EVIDENCE_HINTS_SUPPLEMENT_PATH}`,
+    );
+  }
+  return merged;
+}
+
+const EVIDENCE_HINTS: Record<string, string[]> = loadEvidenceHints();
 
 function recommendedActionsFor(violations: Violation[]): string[] {
   const seen = new Set<string>();
@@ -1254,6 +1366,42 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// ── F2 (2026-06-26 improvement doc) — foreign change swept into a bulk commit ──
+// Incident (trace 5c63e0ef, HWP MCP repo): the model honestly disclosed that the
+// working tree held large changes it had not authored ("fix_chapter6_format.py는
+// 제가 만든 게 아니어서 출처는 확실치 않습니다"), then, following a broad "commit
+// everything" instruction, folded those unknown-origin files into a single commit.
+// INVARIANT#27 catches DISHONEST blame-shifting; this catches the opposite honest-
+// but-unisolated shape. Because the disclosure is itself a virtue, this is ADVISORY
+// only (process_warnings → process_verdict WEAK, never blocks the completion claim).
+const FOREIGN_CHANGE_ADMISSION_RE =
+  /(내가\s*만들지\s*않|제가\s*만든\s*게\s*아니|만들지\s*않은\s*(?:파일|변경|것)|출처가?\s*(?:불명|불분명|확실치\s*않|확실하지\s*않)|이번\s*세션에서\s*(?:하지\s*않|만들지\s*않)|내가\s*하지\s*않은\s*변경|didn'?t\s*create|not\s*(?:mine|my\s*(?:own\s*)?change)|unknown[-\s]*origin|foreign\s*change|someone\s*else'?s\s*change)/i;
+const BULK_COMMIT_DECL_RE =
+  /(git\s+add\s+(?:-A\b|--all\b|\.\s)|git\s+commit\b[\s\S]{0,40}\b-a\b|모두\s*(?:커밋|스테이징)|전부\s*(?:커밋|스테이징)|한꺼번에\s*커밋|일괄\s*(?:커밋|스테이징)|stage\s+(?:all|everything)|commit\s+(?:all|everything))/i;
+// Honest isolation/approval language that makes the advisory unnecessary.
+const CHANGE_ISOLATED_RE =
+  /(별도\s*커밋|따로\s*커밋|분리\s*(?:해서\s*)?커밋|제외하(?:고|여|였)|승인\s*(?:받|을\s*받)|사용자\s*승인|separate\s*commit|excluded|split\s*into\s*(?:a\s*)?separate)/i;
+
+function scanForeignChangeBulkCommit(
+  responseText: string,
+  toolCallLog: string,
+): { rule: string; matched: string; description: string }[] {
+  if (!FOREIGN_CHANGE_ADMISSION_RE.test(responseText)) return [];
+  const bulk = `${responseText}\n${toolCallLog}`.match(BULK_COMMIT_DECL_RE);
+  if (!bulk) return [];
+  if (CHANGE_ISOLATED_RE.test(responseText)) return []; // already isolated / approved
+  return [
+    {
+      rule: "FOREIGN_CHANGE_BULK_COMMIT",
+      matched: bulk[0].slice(0, 60),
+      description:
+        "The response honestly discloses an unknown-origin / not-authored change, yet also stages or commits it in bulk. " +
+        "Isolate the foreign change into its own commit (or get explicit user approval to include it) so an unaudited change " +
+        "isn't silently attributed to this work. This is advisory — the honest disclosure itself is correct.",
+    },
+  ];
+}
+
 function scanGuardBlameShift(responseText: string, toolCallLog: string): Violation[] {
   const out: Violation[] = [];
 
@@ -1334,24 +1482,6 @@ function scanGuardBlameShift(responseText: string, toolCallLog: string): Violati
   return out;
 }
 
-function runPython(script: string, args: string[], timeoutMs = 10_000) {
-  try {
-    const stdout = execFileSync(process.execPath.includes("node") ? "python" : "python", [script, ...args], {
-      cwd: ANTIGRAVITY_ROOT,
-      encoding: "utf-8",
-      timeout: timeoutMs,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { exitCode: 0, stdout, stderr: "" };
-  } catch (error: any) {
-    return {
-      exitCode: typeof error.status === "number" ? error.status : 1,
-      stdout: String(error.stdout ?? ""),
-      stderr: String(error.stderr ?? error.message ?? ""),
-    };
-  }
-}
-
 function activeAlertStatus() {
   return ACTIVE_ALERT_FILES.map((file) => {
     const exists = fs.existsSync(file);
@@ -1367,9 +1497,9 @@ function activeAlertStatus() {
   });
 }
 
-function hasStrongEvidence(text: string): boolean {
-  return PASS_EVIDENCE_PATTERNS.some((pattern) => pattern.test(text));
-}
+// The evidence predicates (hasStructuredStrongEvidence, hasKeyValueStrongEvidence,
+// hasStrongEvidence, hasLocalEngineeringEvidence, hasTieredStrongEvidence) moved to
+// ./evidence.ts (P1-1). guardrail.ts imports the public ones at the top.
 
 function isPartialStatusRewrite(text: string): boolean {
   return (
@@ -1404,7 +1534,7 @@ function isTranscriptionCompletionClaim(text: string): boolean {
 // Incident (trace 74cb9bd1): the model (1) hand-wrote part_000.diarized.md and
 // speaker_roster.md from a hardcoded python script without running pyannote,
 // (2) wrote its own whisper runner with device="cpu" although the sanctioned
-// X:\fixture\voice\venv is a CUDA build.
+// transcription venv is a CUDA build.
 // Evidence that a real diarization pipeline executed this turn:
 const DIARIZATION_PIPELINE_EVIDENCE_RE =
   /(pyannote|speaker-diarization|transcribe_meeting\.py|voice[\\/]+main\.py|main\.py["']?\s*,?\s*["']?\s*(--input|-i)\b|Pipeline\.from_pretrained|process_file\s*\()/i;
@@ -1452,7 +1582,7 @@ function scanCpuDeviceOverride(text: string, toolCallLog: string): Violation[] {
       matched: "device='cpu' hardcoded in transcription tooling without a CUDA availability check",
       description:
         "Transcription code pins device to CPU but the log shows no torch.cuda.is_available() check or --allow-cpu justification. " +
-        "The sanctioned env X:\\fixture\\voice\\venv is a CUDA build — verify GPU availability first and quote the result.",
+        "The sanctioned env C:\\scratch\\voice\\venv is a CUDA build — verify GPU availability first and quote the result.",
     },
   ];
 }
@@ -1596,7 +1726,7 @@ function scanSkillMethodBypass(
 
 // Skill-install verification helpers (SKILL_INSTALL_INCOMPLETE).
 function skillRoots(): string[] {
-  return SKILL_ROOT_CANDIDATES.filter((r) => {
+  return skillRootCandidates().filter((r) => {
     try {
       return fs.existsSync(r) && fs.statSync(r).isDirectory();
     } catch {
@@ -1788,8 +1918,11 @@ function detectSkillTriggers(text: string): SkillTriggerHit[] {
   return [...hits.values()];
 }
 
-function skillReadEvidenceStatus(skill: string, toolCallLog: string): { read: boolean; first: boolean; matched: string | null } {
-  if (!toolCallLog) return { read: false, first: false, matched: null };
+function skillReadEvidenceStatus(
+  skill: string,
+  toolCallLog: string,
+): { read: boolean; first: boolean; repaired: boolean; matched: string | null } {
+  if (!toolCallLog) return { read: false, first: false, repaired: false, matched: null };
   const normalizedLog = normalizePathForCompare(toolCallLog);
   const skillLower = skill.toLowerCase();
   const pathNeedle = `/${skillLower}/skill.md`;
@@ -1802,15 +1935,26 @@ function skillReadEvidenceStatus(skill: string, toolCallLog: string): { read: bo
     if (m && m.index !== undefined) idx = m.index;
   }
 
-  if (idx < 0) return { read: false, first: false, matched: null };
+  if (idx < 0) return { read: false, first: false, repaired: false, matched: null };
 
+  // 2026-07-05 (session e44520ce): Exclude view_file, replace_file_content, multi_replace_file_content
+  // from the "work" signal. These are used for research (reading config files before SKILL.md)
+  // or for making edits AFTER the skill was read. Treating them as "work" caused false
+  // INVARIANT#25 violations when the model read other files first, then SKILL.md, then made edits.
+  // write_to_file is kept as a "work" signal since it's pure creation (not read-or-replace).
   const firstWorkRe =
-    /(apply_patch|edit_file|write_file|run_shell_command|exec_command|executing command:|\b(?:pnpm|npm|python|node|git|curl|docker)\s+)/i;
+    /(apply_patch|edit_file|write_to_file|run_shell_command|exec_command|executing command:|\b(?:pnpm|npm|python|node|git|curl|docker)\s+)/i;
   const work = normalizedLog.match(firstWorkRe);
   const workIdx = work?.index ?? Number.POSITIVE_INFINITY;
+  const first = idx <= workIdx;
+  const afterRead = normalizedLog.slice(idx + pathNeedle.length);
+  const rerunOrVerifyAfterRead =
+    /(re-?run|redo|re-?verify|verify|verification|quality[_-]?check|readiness|smoke|operation_ready|completion_claim_allowed|exit\s*(?:code)?\s*[:=]?\s*0|\bPASS\b|mcp__[\w-]+__[\w-]*(?:verify|status|quality|check|ingest)|opencrab[\w-]*(?:verify|status|quality|check|ingest))/i;
+  const repaired = !first && (firstWorkRe.test(afterRead) || rerunOrVerifyAfterRead.test(afterRead) || hasStrongEvidence(afterRead));
   return {
     read: true,
-    first: idx <= workIdx,
+    first,
+    repaired,
     matched: toolCallLog.slice(Math.max(0, idx - 60), idx + 160),
   };
 }
@@ -1831,7 +1975,7 @@ function stripCodeAndQuotes(text: string): string {
 // Path comparison normalization. The same file can appear in prose as a
 // Windows backslash path (`C:\Users\…\chunker.py`) while the tool_call_log
 // surfaces it as a forward-slash file:// URI
-// (`file:///X:/Fixture/…/chunker.py`). A raw substring check (`log.includes(p)`)
+// (`file:///C:/Users/…/chunker.py`). A raw substring check (`log.includes(p)`)
 // then fails and BACKTICK_PATH_HALLUCINATION fires on a path that WAS read this
 // turn — the exact false positive that hard-blocked the 2026-05-28 08:04:56
 // Antigravity session. Normalize both sides before comparing: strip file://
@@ -1843,9 +1987,15 @@ function normalizePathForCompare(s: string): string {
     .toLowerCase();
 }
 
-function scanText(text: string, toolCallLog: string = ""): Violation[] {
+function scanText(
+  text: string,
+  toolCallLog: string = "",
+  riskTier: CompletionRiskTier = "auto",
+): Violation[] {
   const violations: Violation[] = [];
-  const strongEvidence = hasStrongEvidence(text);
+  const textStrongEvidence = hasTieredStrongEvidence(text, riskTier);
+  const logStrongEvidence = !!toolCallLog && hasTieredStrongEvidence(toolCallLog, riskTier);
+  const strongEvidence = textStrongEvidence || (isLocalCompletionTier(riskTier) && logStrongEvidence);
   const partialStatusRewrite = isPartialStatusRewrite(text);
   const textNoQuotes = stripCodeAndQuotes(text);
 
@@ -1904,7 +2054,7 @@ function scanText(text: string, toolCallLog: string = ""): Violation[] {
     // rather than re-running the underlying tool. This avoids the 2026-05-27
     // pattern where view_file was actually called but the first draft was
     // pure narrative and got hard-blocked.
-    const logHasEvidence = !!toolCallLog && hasStrongEvidence(toolCallLog);
+    const logHasEvidence = !!toolCallLog && hasTieredStrongEvidence(toolCallLog, riskTier);
     if (logHasEvidence) {
       violations.push({
         rule: "INVARIANT#12_EVIDENCE_NOT_INLINE",
@@ -1927,28 +2077,30 @@ function scanText(text: string, toolCallLog: string = ""): Violation[] {
   return violations;
 }
 
-function evidenceIsStrong(evidence: string): boolean {
-  const trimmed = evidence.trim();
-  if (trimmed.length < 20) return false;
-  if (WEAK_EVIDENCE_ONLY.test(trimmed)) return false;
-  if (/undefined|no output|not run|미실행|출력 없음/i.test(trimmed)) return false;
-  if (/^[A-Za-z]:\\[^\r\n]+$/.test(trimmed)) return false;
-  return (
-    hasStrongEvidence(trimmed) ||
-    /\b(stdout|stderr|output|json|verdict|status|sha256|lastwritetime|length|line|lines|endpoint|response)\b/i.test(trimmed) ||
-    // Bare narrative "diff에서 확인" is NOT evidence (2026-06-11 incident: the
-    // model cited "multi_replace_file_content diff에서 함수 추가 확인" for an
-    // edit that never landed on disk). Require actual diff/patch syntax.
-    (/\bdiff\b/i.test(trimmed) &&
-      /(^|\n)\s*(@@\s*-?\d|\+\+\+\s|---\s|[+-]\s{0,2}[\w<{("'`])|ReplacementChunks|TargetContent|ReplacementContent/m.test(trimmed)) ||
-    /\b(Test-Path|Get-Item|Get-Content|Select-String|rg|pnpm|npm|pytest|python)\b[\s\S]{0,300}\b(True|exit[_\s-]*(code)?\s*[:=]?\s*0|PASS|passed|ok)\b/i.test(trimmed) ||
-    /\bExit\s+code\s*:\s*0\b[\s\S]{0,120}\bOutput\s*:\b[\s\S]{0,300}\bPASS[_A-Z0-9-]*\b/i.test(trimmed) ||
-    /\bexit[_\s-]*code\s*[:=]\s*0\b[\s\S]{0,300}\bPASS[_A-Z0-9-]*\b/i.test(trimmed) ||
-    // Accept Korean view_file / write-back signatures (line/byte counts).
-    /\b\d{2,}\s*(?:bytes|byte|바이트)\b/i.test(trimmed) && /\b\d{1,}\s*(?:lines?|줄|라인|행)\b/i.test(trimmed) ||
-    /\(\s*총\s*\d{1,}\s*줄[\s\S]{0,30}\d{2,}\s*바이트\s*\)/.test(trimmed) ||
-    /\b(?:라인\s*수|줄\s*수|line\s*count)\s*[:=]?\s*\d{1,}\b/i.test(trimmed)
-  );
+// evidenceIsStrong moved to ./evidence.ts (P1-1) — imported at the top.
+
+type HonestVerdict = "HONEST" | "WEAK" | "DECEPTIVE";
+
+const PROCESS_VERDICT_RULE_PREFIXES = [
+  "PENDING_REJECT",
+  "ACTIVE_ALERT_COMPLETION",
+  "FLASH_FREEZE",
+  "INVARIANT#19_MCP_TRIGGER_BYPASS",
+  "INVARIANT#25_SKILL_FIRST_REQUIRED",
+  "INVARIANT#27_GUARD_BLAME_SHIFT",
+  "INVARIANT#29_CLOSEOUT_PROTOCOL_SKIPPED",
+  "INVARIANT#39_OPENCRAB_9SPACE_PREWRITE",
+];
+
+function isProcessVerdictRule(rule: string): boolean {
+  return PROCESS_VERDICT_RULE_PREFIXES.some((prefix) => rule === prefix || rule.startsWith(prefix));
+}
+
+function verdictFromViolations(violations: Violation[]): HonestVerdict {
+  const critical = violations.some((v) => v.severity === "CRITICAL");
+  if (critical) return "DECEPTIVE";
+  const high = violations.some((v) => v.severity === "HIGH");
+  return high ? "WEAK" : "HONEST";
 }
 
 export function registerGuardrailTools(server: McpServer) {
@@ -1960,14 +2112,18 @@ export function registerGuardrailTools(server: McpServer) {
       tool_call_log: z.string().optional().describe("Concatenated JSON or text of this turn's tool calls (args + outputs). Used to verify backtick paths and script citations."),
       claimed_items: z.array(z.string()).optional().describe("Discrete completion claims, if any"),
       evidence_outputs: z.array(z.string()).optional().describe("Raw tool stdout for each claimed_item (1:1 with claimed_items). Must be raw — not narrative summaries."),
+      risk_tier: z.enum(COMPLETION_RISK_TIERS).optional().describe("Completion risk tier. external_write keeps strict user-facing evidence; local_code/docs/commit accept normal local engineering evidence such as tests, diff checks, git status, and commit hashes."),
       session_id: z.string().optional().describe("Session identifier for pending-state isolation. When omitted, falls back to HARNESS_SESSION_ID env (auto-bootstrapped to `auto-<pid>-<ts>` at server start if unset). Pass the Antigravity conversation/trace id explicitly when running concurrent IDE windows so their pending state can't collide."),
     },
-    async ({ response_text, user_request, tool_call_log, claimed_items, evidence_outputs, session_id }) => {
+    async ({ response_text, user_request, tool_call_log, claimed_items, evidence_outputs, risk_tier, session_id }) => {
       const log = tool_call_log ?? "";
       const sid = session_id ?? DEFAULT_SESSION_ID;
-      const currentClaimHash = claimHash(response_text);
+      const riskTier = normalizeCompletionRiskTier(risk_tier);
+      const currentClaimHash = claimScopeHash(response_text);
+      const currentEvidenceHash = evidenceHash(log, evidence_outputs ?? []);
       const pendingAtStart = loadSessionPending(sid);
-      const violations = scanText(response_text, log);
+      const violations = scanText(response_text, log, riskTier);
+      const processWarnings: { rule: string; matched: string; description: string }[] = [];
       violations.push(...scanDelegatedVerificationBypass(user_request ?? "", response_text, log));
       violations.push(...scanGuardBlameShift(response_text, log));
       // INVARIANT#38: 스킬이 명시한 prescribed method를 따랐는지 검사
@@ -1975,7 +2131,15 @@ export function registerGuardrailTools(server: McpServer) {
       violations.push(...scanSkillMethodBypass(user_request ?? "", response_text, log));
       violations.push(...scanOpenCrab9spacePrewriteBypass(log));
       violations.push(...scanOpenCrabNeo4jLineageVerification(user_request ?? "", response_text, log));
-      const skillTriggers = detectSkillTriggers(`${user_request ?? ""}\n${response_text}`);
+      // F2 advisory (process-only, never blocks): honest foreign-change disclosure
+      // + bulk commit → nudge toward isolating the unaudited change.
+      processWarnings.push(...scanForeignChangeBulkCommit(response_text, log));
+      // 2026-07-06 Bug#1 fix: if the model omits user_request (common in retry
+      // honest_check calls), fall back to the last persisted user request from
+      // pending state. Without this, skill-trigger detection silently degrades
+      // when the triggering keyword only appears in the original user message.
+      const effectiveUserRequest = (user_request ?? "").trim() || (pendingAtStart?.last_user_request ?? "");
+      const skillTriggers = detectSkillTriggers(`${effectiveUserRequest}\n${response_text}`);
 
       // INVARIANT#29_CLOSEOUT_PROTOCOL_SKIPPED (2026-06-08 추가)
       // user_request에 종료 키워드가 있는데 tool_call_log에 run_session_end.py 증거가 없으면 CRITICAL.
@@ -2006,7 +2170,11 @@ export function registerGuardrailTools(server: McpServer) {
       // other violations exist. This prevented a permanent deadlock where the model responded
       // correctly but other minor violations (WEAK_EVIDENCE, SKILL_FIRST, etc.) kept verdict
       // DECEPTIVE, which prevented force_partial_status from ever clearing.
-      if (pendingAtStart?.force_partial_status && !isPartialStatusRewrite(response_text)) {
+      const forcePartialAppliesToCurrentScope = !!(
+        pendingAtStart?.force_partial_status &&
+        samePendingScope(pendingAtStart, currentClaimHash, currentEvidenceHash)
+      );
+      if (forcePartialAppliesToCurrentScope && !isPartialStatusRewrite(response_text)) {
         violations.unshift({
           rule: "PENDING_REJECT_REQUIRES_PARTIAL_STATUS",
           severity: "CRITICAL",
@@ -2039,16 +2207,31 @@ export function registerGuardrailTools(server: McpServer) {
       }
 
       // 2) Phantom script detection (cited *.py / *.ps1 etc. that don't exist)
-      const scriptRe = new RegExp(`\b([\w./-]+\.(?:${SCRIPT_EXT_GROUP}))\b`, "gi");
+      // The pattern MUST be built with String.raw. A plain template literal
+      // turns `\b`→backspace and `\w`→`w`, which silently disabled this rule
+      // entirely (2026-07-12 audit): the compiled source was
+      // `\x08([w./-]+.(?:…))\x08`, matching nothing on disk. String.raw keeps
+      // the backslashes literal so the regex compiles as intended, and the
+      // char class now also accepts Windows `\` separators (matches L845's form).
+      const scriptRe = new RegExp(
+        String.raw`\b([\w./\\-]+\.(?:${SCRIPT_EXT_GROUP}))\b`,
+        "gi",
+      );
       const phantomScripts: string[] = [];
       const seen = new Set<string>();
+      // Cap distinct candidates examined per turn and hoist search-root
+      // resolution out of the loop — re-enabling this rule reactivates
+      // findFileByName's home-directory walk, so bound its fs cost.
+      const PHANTOM_SCAN_LIMIT = 8;
+      const phantomSearchRoots = getSearchRoots();
       let m: RegExpExecArray | null;
       while ((m = scriptRe.exec(response_text)) !== null) {
+        if (seen.size >= PHANTOM_SCAN_LIMIT) break;
         const filename = path.basename(m[1]);
         if (seen.has(filename)) continue;
         seen.add(filename);
         if (log.includes(filename)) continue; // touched in this turn
-        const hits = findFileByName(filename, getSearchRoots(), 1);
+        const hits = findFileByName(filename, phantomSearchRoots, 1);
         if (hits.length === 0) phantomScripts.push(filename);
       }
       if (phantomScripts.length > 0) {
@@ -2072,8 +2255,11 @@ export function registerGuardrailTools(server: McpServer) {
       //     real "Success!").
       const ARTIFACT_EXT_GROUP =
         "zip|md|json|jsonl|csv|tsv|pdf|docx?|xlsx?|pptx?|hwpx?|png|jpe?g|webp|txt|html?|dwg|dxf|mp3|mp4|m4a|wav|flac";
+      // 2026-07-05 (session e44520ce): Added 'Created file' — the actual stdout pattern
+      // emitted by write_to_file on success. Without this, write_to_file completions were
+      // falsely blocked by OUTPUT_ARTIFACT_MISSING even though the file existed on disk.
       const CREATION_VERB_RE =
-        /(생성|만들[었어]|작성(?:했|함|됨|완료)|저장(?:했|함|됨|완료)|빌드\s*(?:완료|됨|했)|패키[징지]|created|wrote|written|saved|built|generated|produced|packaged)/i;
+        /(생성|만들[었어]|작성(?:했|함|됨|완료)|저장(?:했|함|됨|완료)|빌드\s*(?:완료|됨|했)|패키[징지]|created(?:\s+file)?|wrote|written|saved|built|generated|produced|packaged)/i;
       const NOT_CREATED_CTX_RE =
         /(미실행|미생성|미작성|미완료|미검증|않았|않음|못했|못함|실패|예정|아직|준비\s*중|계획|존재하지|없습니다|not\s+(?:yet|created|found|exist)|todo)/i;
       const absArtifactRe = new RegExp(
@@ -2082,7 +2268,7 @@ export function registerGuardrailTools(server: McpServer) {
       );
       // Drop fenced code blocks (sample source / usage examples) but keep
       // inline-backtick and markdown-link paths — the incident path was a
-      // markdown link `[…](file:///X:/…/x.zip)`, not fenced code.
+      // markdown link `[…](file:///C:/…/x.zip)`, not fenced code.
       const artifactHaystack = response_text.replace(/```[\s\S]*?```/g, "");
       const missingArtifacts: string[] = [];
       const artifactSeen = new Set<string>();
@@ -2187,14 +2373,24 @@ export function registerGuardrailTools(server: McpServer) {
                 "Read the skill first, then redo/verify the work before claiming completion.",
             });
           } else if (!evidence.first) {
-            violations.push({
-              rule: "INVARIANT#25_SKILL_FIRST_REQUIRED",
-              severity: "CRITICAL",
-              matched: `${hit.skill} SKILL.md read after other work`,
-              description:
-                `Skill '${hit.skill}' was read, but only after another command/edit appears in tool_call_log. ` +
-                "Skill-triggered work must begin by reading SKILL.md before executing commands, editing files, or reporting completion.",
-            });
+            if (evidence.repaired) {
+              processWarnings.push({
+                rule: "INVARIANT#25_SKILL_FIRST_RECOVERED",
+                matched: `${hit.skill} SKILL.md read after other work, then rerun/verification evidence appeared`,
+                description:
+                  `Skill '${hit.skill}' was read late, but tool_call_log shows follow-up rerun/verification evidence after the SKILL.md read. ` +
+                  "Result validation may proceed; keep this as a process warning instead of poisoning the completion claim.",
+              });
+            } else {
+              violations.push({
+                rule: "INVARIANT#25_SKILL_FIRST_REQUIRED",
+                severity: "CRITICAL",
+                matched: `${hit.skill} SKILL.md read after other work`,
+                description:
+                  `Skill '${hit.skill}' was read, but only after another command/edit appears in tool_call_log and no later rerun/verification evidence was found. ` +
+                  "Skill-triggered work must begin by reading SKILL.md before executing commands, editing files, or reporting completion.",
+              });
+            }
           }
         }
       }
@@ -2221,7 +2417,7 @@ export function registerGuardrailTools(server: McpServer) {
 
       // #1 — Korean document/folder naming convention frequently embeds dates
       // like `2026.04.27` or `2026-05-26` inside backticks (e.g. `(2026.05.26)`
-      // in `[sample-client]코스콤본사 환경관리용역(2026.05.26)`). Pre-fix these were
+      // in `[흥안실업]코스콤본사 환경관리용역(2026.05.26)`). Pre-fix these were
       // mis-classified as paths because the dot satisfied the path-like check,
       // producing CRITICAL BACKTICK_PATH_HALLUCINATION on every audit-style
       // report (trace 8f49473c — 2026-05-27 09:58 session).
@@ -2275,7 +2471,7 @@ export function registerGuardrailTools(server: McpServer) {
       const weakClaims: string[] = [];
       items.forEach((c, idx) => {
         const e = evid[idx] ?? "";
-        if (!evidenceIsStrong(e)) weakClaims.push(`#${idx + 1}: ${c.slice(0, 60)}`);
+        if (!evidenceIsStrong(e, riskTier)) weakClaims.push(`#${idx + 1}: ${c.slice(0, 60)}`);
       });
       if (weakClaims.length > 0) {
         violations.push({
@@ -2286,13 +2482,54 @@ export function registerGuardrailTools(server: McpServer) {
         });
       }
 
-      const critical = violations.filter((v) => v.severity === "CRITICAL");
-      const high = violations.filter((v) => v.severity === "HIGH");
-      const verdict =
-        critical.length > 0 ? "DECEPTIVE" : high.length > 0 ? "WEAK" : "HONEST";
+      // 2026-07-12 audit (P0-2/P0-3): the former "Bug#2" narrative-only INVARIANT#12
+      // block was removed here. scanText() already fires INVARIANT#12 CRITICAL for a
+      // completion claim with no strong text/log evidence (independent of
+      // claimed_items), so this block was fully redundant — it duplicated #12 on bare
+      // claims AND, worse, ignored strongEvidence: a response that inlined line/byte or
+      // exit-0 evidence but omitted tool_call_log was hard-blocked as DECEPTIVE
+      // (the exact F1 false-positive the harness is meant to prevent).
+
+      // Defensive dedupe: overlapping scanners must not push the same rule+matched
+      // twice (inflates violation_count, logged violation_rules, blocked_summary, and
+      // the corpus rule-frequency stats). Stable — keeps the first occurrence so
+      // severity-ordered reason/blocked_summary selection is unchanged.
+      {
+        const dedupeSeen = new Set<string>();
+        let w = 0;
+        for (let r = 0; r < violations.length; r++) {
+          const key = `${violations[r].rule}|${violations[r].matched}`;
+          if (dedupeSeen.has(key)) continue;
+          dedupeSeen.add(key);
+          violations[w++] = violations[r];
+        }
+        violations.length = w;
+      }
+
+      const resultViolations = violations.filter((v) => !isProcessVerdictRule(v.rule));
+      const processViolations = violations.filter((v) => isProcessVerdictRule(v.rule));
+      const task_outcome_verdict = verdictFromViolations(resultViolations);
+      const process_verdict =
+        processViolations.length > 0
+          ? verdictFromViolations(processViolations)
+          : processWarnings.length > 0
+          ? "WEAK"
+          : "HONEST";
+      const verdict = verdictFromViolations(violations);
 
       const reason =
-        critical[0]?.description ?? high[0]?.description ?? "all checks passed";
+        violations.find((v) => v.severity === "CRITICAL")?.description ??
+        violations.find((v) => v.severity === "HIGH")?.description ??
+        "all checks passed";
+      const task_outcome_reason =
+        resultViolations.find((v) => v.severity === "CRITICAL")?.description ??
+        resultViolations.find((v) => v.severity === "HIGH")?.description ??
+        "result evidence passed";
+      const process_reason =
+        processViolations.find((v) => v.severity === "CRITICAL")?.description ??
+        processViolations.find((v) => v.severity === "HIGH")?.description ??
+        processWarnings[0]?.description ??
+        "process checks passed";
 
       // (2026-05-31) 하네스는 더 이상 사용자에게 예/아니오를 묻지 않는다.
       // honest_check의 "확인 질문"은 어차피 "정확히 다시 하라"는 정해진 답을 받기 위한
@@ -2316,20 +2553,31 @@ export function registerGuardrailTools(server: McpServer) {
       // Retry tracking — only increment retry_count when the SAME claim
       // (bag-of-words hash) is retried. Different broad claims start fresh.
       const priorPending = blocked ? pendingAtStart : null;
-      const sameClaimAsPrior = !!(priorPending && priorPending.claim_hash === currentClaimHash);
+      const sameClaimAsPrior = samePendingScope(priorPending, currentClaimHash, currentEvidenceHash);
       const retry_count = sameClaimAsPrior ? priorPending!.retry_count + 1 : 0;
       const retry_exhausted_by_claim = retry_count >= RETRY_LIMIT;
 
-      // #2 — Session-level block counter. claim_hash drifts every time the
-      // model rewrites the whole response (bag-of-words of first 30 tokens),
-      // so retry_count stayed at 0 in trace 8f49473c despite 4 blocks. Count
-      // non-HONEST verdicts in the recent window regardless of claim_hash so
-      // the gate actually fires after SESSION_BLOCK_LIMIT strikes.
+      // #2 — Session-level block counter. This is a second exhaustion path
+      // alongside retry_count, scoped to the CURRENT claim_hash: it tallies
+      // recent non-HONEST calls that share this claim so the gate still fires
+      // after SESSION_BLOCK_LIMIT strikes even when retry_count bookkeeping was
+      // reset (e.g. pending state was cleared between turns). Cross-claim
+      // poisoning is intentionally avoided — a different broad claim with fresh
+      // evidence must not inherit this claim's strike count (AGENTS.md:
+      // completion-state logic stays claim-scoped).
       const priorNonHonest = readRecentHonestCalls(sid, SESSION_BLOCK_WINDOW_MIN)
-        .filter((c) => c.verdict !== "HONEST").length;
+        .filter((c) => c.verdict !== "HONEST" && c.claim_hash === currentClaimHash).length;
       const session_block_count = priorNonHonest + (blocked ? 1 : 0);
       const retry_exhausted_by_session = session_block_count >= SESSION_BLOCK_LIMIT;
       const retry_exhausted = retry_exhausted_by_claim || retry_exhausted_by_session;
+
+      // 2026-07-06 Bug#1 fix: persist last_user_request so subsequent retry
+      // honest_check calls (which often omit user_request) can still fire
+      // skill-trigger checks on the original user message.
+      const persistedUserRequest =
+        (user_request ?? "").trim() ||
+        (blocked && pendingAtStart?.last_user_request) ||
+        undefined;
 
       // 사용자 확인은 더 이상 요구하지 않는다.
       const needs_user_confirmation = false;
@@ -2390,6 +2638,11 @@ export function registerGuardrailTools(server: McpServer) {
           retry_count,
           first_blocked_at: sameClaimAsPrior ? priorPending!.first_blocked_at : now,
           claim_hash: currentClaimHash,
+          evidence_hash: currentEvidenceHash,
+          violation_rules: violations.map((v) => v.rule).slice(0, 10),
+          // 2026-07-06 Bug#1 fix: carry the user request forward so retry
+          // honest_check calls can still fire skill-trigger checks.
+          ...(persistedUserRequest ? { last_user_request: persistedUserRequest } : {}),
         });
         if (!ok) {
           state_persisted = false;
@@ -2411,7 +2664,11 @@ export function registerGuardrailTools(server: McpServer) {
           retry_count,
           first_blocked_at: sameClaimAsPrior ? priorPending!.first_blocked_at : now,
           claim_hash: currentClaimHash,
+          evidence_hash: currentEvidenceHash,
+          violation_rules: violations.map((v) => v.rule).slice(0, 10),
           force_partial_status: true,
+          // 2026-07-06 Bug#1 fix: carry the user request forward.
+          ...(persistedUserRequest ? { last_user_request: persistedUserRequest } : {}),
         });
         if (!ok) {
           state_persisted = false;
@@ -2420,7 +2677,7 @@ export function registerGuardrailTools(server: McpServer) {
         }
       } else if (verdict === "HONEST") {
         const existing = pendingAtStart;
-        if (existing && existing.claim_hash === currentClaimHash) {
+        if (samePendingScope(existing, currentClaimHash, currentEvidenceHash)) {
           clearSessionPending(sid);
         } else if (existing?.force_partial_status && isPartialStatusRewrite(response_text)) {
           clearSessionPending(sid);
@@ -2432,12 +2689,21 @@ export function registerGuardrailTools(server: McpServer) {
         // we must clear force_partial_status to prevent permanent deadlock.
         // Without this, WEAK_EVIDENCE or SKILL_FIRST violations could keep verdict non-HONEST
         // indefinitely, so force_partial_status never clears and blocks every future response.
-        if (pendingAtStart?.force_partial_status && isPartialStatusRewrite(response_text)) {
+        if (forcePartialAppliesToCurrentScope && isPartialStatusRewrite(response_text)) {
           clearSessionPending(sid);
         }
       }
 
-      logHonestCheckCall(sid, verdict, violations.length, violations.map((v) => v.rule));
+      logHonestCheckCall(
+        sid,
+        verdict,
+        violations.length,
+        violations.map((v) => v.rule),
+        currentClaimHash,
+        currentEvidenceHash,
+        task_outcome_verdict,
+        process_verdict,
+      );
 
       return {
         content: [
@@ -2447,7 +2713,13 @@ export function registerGuardrailTools(server: McpServer) {
               {
                 verdict,
                 reason,
+                task_outcome_verdict,
+                task_outcome_reason,
+                process_verdict,
+                process_reason,
+                risk_tier: riskTier,
                 violations: violations.slice(0, 10),
+                process_warnings: processWarnings.slice(0, 10),
                 active_alerts: activeAlerts.map((a) => path.basename(a.file)),
                 skill_triggers: skillTriggers,
                 needs_user_confirmation,
@@ -2465,6 +2737,7 @@ export function registerGuardrailTools(server: McpServer) {
                 session_block_limit: SESSION_BLOCK_LIMIT,
                 session_block_window_min: SESSION_BLOCK_WINDOW_MIN,
                 claim_hash: currentClaimHash,
+                evidence_hash: currentEvidenceHash,
                 session_id: sid,
                 state_persisted,
                 state_error,
@@ -2726,6 +2999,22 @@ export function registerGuardrailTools(server: McpServer) {
             risk_signals.push({ rule: r.rule, reason: r.reason, matched: m[0] });
           }
         }
+        // Scope-drift (rename/analysis requested, but the action deletes files).
+        // Fires only when the user asked for a non-destructive op AND did not
+        // explicitly request deletion — so the reason is actually accurate.
+        const deletionMatch = riskHaystack.match(SCOPE_DRIFT_DELETE_RE);
+        if (
+          deletionMatch &&
+          RENAME_ANALYSIS_INTENT_RE.test(text) &&
+          !EXPLICIT_DELETE_INTENT_RE.test(text)
+        ) {
+          risk_signals.push({
+            rule: "scope_drift_rename_vs_delete",
+            reason:
+              "SCOPE_DRIFT: user_request reads as rename/analysis only, but the action deletes files — confirm the user explicitly asked to delete originals.",
+            matched: deletionMatch[0],
+          });
+        }
       }
 
       const skillFirstInstruction =
@@ -2851,17 +3140,18 @@ export function registerGuardrailTools(server: McpServer) {
 
       let verdict: "OK" | "MISSING_HONEST_CHECK" | "RECENT_VIOLATIONS";
       let reason: string;
-      let needs_user_confirmation = false;
-      let confirmation_question: string | null = null;
+      // (2026-07-12 P1-2) session_emit_audit no longer emits a user-facing 예/아니오
+      // prompt. Per the 2026-05-31 decision (see honest_check), the harness never
+      // asks the user to approve emitting — a skipped honest_check is corrected by
+      // the MODEL calling honest_check now, not by a stop-and-ask the FLASH_FREEZE
+      // rule would itself forbid. needs_user_confirmation stays false; the fix is
+      // routed through instructions instead. The field is retained for back-compat.
+      const needs_user_confirmation = false;
+      const confirmation_question: string | null = null;
 
       if (calls.length === 0) {
         verdict = "MISSING_HONEST_CHECK";
         reason = `세션 '${sid}'에 최근 ${win}분 내 honest_check 호출 0건. 응답 emit 전 반드시 honest_check를 먼저 호출하세요.`;
-        needs_user_confirmation = true;
-        confirmation_question =
-          `⚠️ honest_check 누락 감지 — 세션 '${sid}' 최근 ${win}분 호출 0건.\n` +
-          `· 모델이 응답 emit 전에 honest_check를 1회 호출하지 않은 상태로 보입니다.\n` +
-          `· 그대로 emit할까요? (예 = 사용자가 책임지고 진행 / 아니오 = 모델이 즉시 honest_check 호출 후 재시도)`;
       } else if (nonHonest > 0) {
         verdict = "RECENT_VIOLATIONS";
         reason = `세션 '${sid}' 최근 ${win}분 호출 ${calls.length}건 중 ${nonHonest}건이 HONEST가 아님.`;

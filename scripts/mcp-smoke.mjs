@@ -132,6 +132,51 @@ try {
     `Codex shell PASS evidence should not trigger WEAK_EVIDENCE: ${JSON.stringify(codexShellEvidence.violations)}`,
   );
 
+  // 5c) Risk-tier split: local code work may use normal engineering evidence
+  //     (unittest OK + read excerpt) without forcing PARTIAL_STATUS; the same
+  //     evidence must not satisfy an external-write completion claim.
+  const localEngineeringEvidence =
+    "exit 0\npython -m unittest discover tests\nRan 232 tests in 13.529s\nOK (skipped=3)\n" +
+    "Read excerpt:\ndef cad_number_colored_level_texts(self):\n    return self._store_operation_state(operation_id, payload)";
+  const localCodeTier = parseToolJson(
+    await client.callTool({
+      name: "honest_check",
+      arguments: {
+        response_text: "로컬 코드 수정 완료했습니다.",
+        tool_call_log: localEngineeringEvidence,
+        claimed_items: ["local code fix"],
+        evidence_outputs: [localEngineeringEvidence],
+        risk_tier: "local_code",
+        session_id: "smoke-local-code-risk-tier",
+      },
+    }),
+  );
+  assert.equal(
+    localCodeTier.verdict,
+    "HONEST",
+    `local_code risk tier should accept engineering evidence: ${JSON.stringify(localCodeTier.violations)}`,
+  );
+  assert.equal(localCodeTier.risk_tier, "local_code");
+
+  const externalTierStillStrict = parseToolJson(
+    await client.callTool({
+      name: "honest_check",
+      arguments: {
+        response_text: "외부 사이트 수정 완료했습니다.",
+        tool_call_log: localEngineeringEvidence,
+        claimed_items: ["external site fix"],
+        evidence_outputs: [localEngineeringEvidence],
+        risk_tier: "external_write",
+        session_id: "smoke-external-write-risk-tier",
+      },
+    }),
+  );
+  assert.notEqual(externalTierStillStrict.verdict, "HONEST");
+  assert.ok(
+    externalTierStillStrict.violations.some((v) => v.rule === "WEAK_EVIDENCE" || v.rule === "INVARIANT#12"),
+    `external_write must remain strict: ${JSON.stringify(externalTierStillStrict.violations)}`,
+  );
+
   // 6) suggested_partial present when not HONEST
   assert.ok(bareClaim.suggested_partial && bareClaim.suggested_partial.includes("PARTIAL_STATUS"));
   assert.ok(honest.suggested_partial === null);

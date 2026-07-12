@@ -13,8 +13,13 @@ governance가 정상 작동했으나 **커밋 분리 가드의 공백**을 드�
 
 | ID | 심각도 | 분류 | 한 줄 요약 | 상태 |
 |----|--------|------|-----------|------|
-| **F1** | High | 오탐(과차단) | `pytest x.py → 29 passed`를 인라인 마크다운으로 보고하면 INVARIANT#15가 CRITICAL로 오발동 | ✅ **구현 완료 (2026-06-27)** |
-| **F2** | Medium | 가드 공백 | "내가 하지 않은 변경"을 인지·고지했음에도 단일 커밋에 포함 — 분리 강제 가드 없음 | 제안(미구현) |
+| **F1** | High | 오탐(과차단) | `pytest x.py → 29 passed`를 인라인 마크다운으로 보고하면 INVARIANT#15가 CRITICAL로 오발동 | ✅ 구현(2026-06-27) → 2026-07-06 회귀(Bug#2) → ✅ **재수정 P0-2 (2026-07-12)** |
+| **F2** | Medium | 가드 공백 | "내가 하지 않은 변경"을 인지·고지했음에도 단일 커밋에 포함 — 분리 강제 가드 없음 | ✅ **ADVISORY 구현 P1-3 (2026-07-12)** — `FOREIGN_CHANGE_BULK_COMMIT` process_warning |
+
+> **2026-07-12 후속**: F1은 2026-07-06 "Bug#2 fix"가 본문 강증거를 무시하는 무조건
+> INVARIANT#12 블록을 넣어 사실상 재발했다(강증거 인용 + tool_call_log 생략 시 DECEPTIVE).
+> `HARNESS_IMPROVEMENT_PLAN_20260712.md` P0-2에서 그 블록을 제거해 재수정했다. F2는 같은
+> 사이클에서 ADVISORY(차단 없음, `process_verdict` WEAK)로 구현했다.
 
 > **F1 구현 결과**: `PASS_EVIDENCE_PATTERNS`(`guardrail.ts:590`)에 펜스 비의존
 > 테스트/빌드 증거 패턴 3종 추가(`\d+ passed` · `\d+ 통과` · `runner + exit 0/compiled`).

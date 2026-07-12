@@ -27,22 +27,32 @@ environments.
 
 ```text
 .
+|-- .github/
+|   `-- workflows/
+|       `-- ci.yml
 |-- config/
 |   |-- mcp_triggers.json
 |   `-- skill_routes.supplement.json
 |-- scripts/
 |   |-- mcp-smoke.mjs
 |   |-- mcp-regression.mjs
+|   |-- new-rules-smoke.mjs
+|   |-- log-rotation-smoke.mjs
+|   |-- runtime-check.mjs
+|   |-- spec-pack-smoke.mjs
 |   |-- corpus-regression.mjs
+|   |-- ci-seed-fixtures.mjs
 |   `-- build-langfuse-incident-corpus.mjs
 |-- src/
 |   |-- index.ts
 |   `-- tools/
 |       |-- guardrail.ts
+|       |-- evidence.ts
 |       `-- spec_pack_audit.ts
 |-- testdata/
 |   `-- incidents/
 |       `-- langfuse-antigravity-corpus.json
+|-- docs/
 |-- package.json
 `-- tsconfig.json
 ```
@@ -86,8 +96,11 @@ node build/index.js
 When the server starts, it writes a status line like this to stderr:
 
 ```text
-AI-Governor-Harness MCP server v2.5.0 running on stdio (session_id=...)
+AI-Governor-Harness MCP server v2.6.0 running on stdio (session_id=...)
 ```
+
+The version string is read from `package.json` as the single source of truth —
+bump `version` there and the banner and server declaration follow automatically.
 
 ## MCP Client Example
 
@@ -125,6 +138,18 @@ This runs:
 pnpm build
 node scripts/mcp-smoke.mjs
 node scripts/mcp-regression.mjs
+node scripts/new-rules-smoke.mjs
+node scripts/runtime-check.mjs
+node scripts/corpus-regression.mjs
+```
+
+`spec_pack_audit` depends on an external `pack_audit.py`, so it lives in a
+separate script. It falls back to a bundled fixture
+(`testdata/fixtures/pack_audit_stub.py`) that implements the same CLI contract,
+so it runs anywhere Python is available:
+
+```bash
+pnpm test:spec   # uses the bundled fixture; set SPEC_PACK_AUDIT_PY to test the real script
 ```
 
 Run the public synthetic corpus regression suite:
@@ -132,6 +157,15 @@ Run the public synthetic corpus regression suite:
 ```bash
 pnpm corpus:test
 ```
+
+### CI
+
+`.github/workflows/ci.yml` runs `pnpm test` on an ubuntu + windows matrix for
+every push/PR. Because the skill-first (INVARIANT#25) and skill-install checks
+read skills from disk, CI first runs `scripts/ci-seed-fixtures.mjs` to create
+deterministic skill fixtures plus the transcription route and injects
+`HARNESS_SKILL_ROOTS` / `HARNESS_SKILL_ROUTES_CONFIG`, so the suite is green
+regardless of which skills are installed on the host.
 
 Build a local Langfuse-derived corpus:
 
@@ -149,7 +183,9 @@ checked-in corpus is synthetic and intentionally contains no private traces.
 | --- | --- |
 | `HARNESS_SESSION_ID` | Default session ID. If missing or set to `default`, an automatic ID is generated. |
 | `HARNESS_STATE_DIR` | Directory for pending state and call logs. Tests inject a temporary directory. |
+| `HARNESS_HONEST_LOG_MAX_BYTES` | honest_check call-log rotation threshold (default 5MB). Tests inject a small value to force rotation cheaply. |
 | `HARNESS_SEARCH_ROOTS` | File-name search roots, separated by the OS-specific path delimiter. |
+| `HARNESS_SKILL_ROOTS` | Skill-root search list. When set, overrides the default candidates (`~/.claude/skills`, etc.). Used by tests/CI to inject deterministic skill fixtures. |
 | `HARNESS_MCP_TRIGGERS_CONFIG` | Alternate path for `mcp_triggers.json`. |
 | `HARNESS_SKILL_ROUTES_CONFIG` | Alternate path for skill-routing JSON. |
 | `HARNESS_MCP_TRIGGERS_NO_CROSS_CHECK` | Set to `1` to disable MCP config cross-checking. |

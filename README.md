@@ -18,22 +18,32 @@ AI Governor Harness는 AI 에이전트가 "작업을 끝냈다"고 보고하기 
 
 ```text
 .
+|-- .github/
+|   `-- workflows/
+|       `-- ci.yml
 |-- config/
 |   |-- mcp_triggers.json
 |   `-- skill_routes.supplement.json
 |-- scripts/
 |   |-- mcp-smoke.mjs
 |   |-- mcp-regression.mjs
+|   |-- new-rules-smoke.mjs
+|   |-- log-rotation-smoke.mjs
+|   |-- runtime-check.mjs
+|   |-- spec-pack-smoke.mjs
 |   |-- corpus-regression.mjs
+|   |-- ci-seed-fixtures.mjs
 |   `-- build-langfuse-incident-corpus.mjs
 |-- src/
 |   |-- index.ts
 |   `-- tools/
 |       |-- guardrail.ts
+|       |-- evidence.ts
 |       `-- spec_pack_audit.ts
 |-- testdata/
 |   `-- incidents/
 |       `-- langfuse-antigravity-corpus.json
+|-- docs/
 |-- package.json
 `-- tsconfig.json
 ```
@@ -76,8 +86,10 @@ node build/index.js
 서버가 시작되면 stderr에 다음과 비슷한 상태 메시지가 출력됩니다.
 
 ```text
-AI-Governor-Harness MCP server v2.5.0 running on stdio (session_id=...)
+AI-Governor-Harness MCP server v2.6.0 running on stdio (session_id=...)
 ```
+
+버전 문자열은 `package.json`을 단일 출처로 읽습니다. 배너·서버 선언을 따로 고칠 필요 없이 `package.json`의 `version`만 올리면 됩니다.
 
 ## MCP 클라이언트 설정 예시
 
@@ -113,6 +125,17 @@ pnpm test
 pnpm build
 node scripts/mcp-smoke.mjs
 node scripts/mcp-regression.mjs
+node scripts/new-rules-smoke.mjs
+node scripts/runtime-check.mjs
+node scripts/corpus-regression.mjs
+```
+
+`spec_pack_audit`는 외부 `pack_audit.py`에 의존하므로 별도 스크립트로 분리돼 있습니다.
+실제 스킬이 없어도 저장소에 포함된 픽스처(`testdata/fixtures/pack_audit_stub.py`)로
+동일 CLI 계약을 검증하므로 Python만 있으면 어디서나 실행됩니다.
+
+```bash
+pnpm test:spec   # 번들 픽스처 사용. SPEC_PACK_AUDIT_PY를 지정하면 실제 스크립트를 검증
 ```
 
 공개용 synthetic corpus 회귀 테스트는 별도로 실행할 수 있습니다.
@@ -120,6 +143,14 @@ node scripts/mcp-regression.mjs
 ```bash
 pnpm corpus:test
 ```
+
+### CI
+
+`.github/workflows/ci.yml`이 push/PR마다 ubuntu + windows 매트릭스에서 `pnpm test`를
+실행합니다. 스킬 우선(INVARIANT#25) 및 스킬 설치 검사는 디스크의 스킬을 참조하므로,
+CI는 `scripts/ci-seed-fixtures.mjs`로 결정적 스킬 픽스처와 전사 라우트를 생성하고
+`HARNESS_SKILL_ROOTS` / `HARNESS_SKILL_ROUTES_CONFIG`를 주입해 호스트에 설치된 스킬과
+무관하게 그린을 보장합니다.
 
 로컬 Langfuse 데이터에서 corpus를 생성하려면 다음 명령을 사용합니다.
 
@@ -135,7 +166,9 @@ pnpm corpus:build
 | --- | --- |
 | `HARNESS_SESSION_ID` | 기본 세션 ID입니다. 없거나 `default`이면 서버가 자동 ID를 생성합니다. |
 | `HARNESS_STATE_DIR` | pending state와 호출 로그를 저장하는 디렉터리입니다. 테스트에서는 임시 디렉터리를 주입합니다. |
+| `HARNESS_HONEST_LOG_MAX_BYTES` | honest_check 호출 로그 로테이션 임계값(기본 5MB)입니다. 테스트가 로테이션을 저렴하게 강제할 때 작은 값을 주입합니다. |
 | `HARNESS_SEARCH_ROOTS` | 파일명 검색 루트 목록입니다. OS별 path delimiter로 구분합니다. |
+| `HARNESS_SKILL_ROOTS` | 스킬 루트 검색 목록입니다. 설정하면 기본 후보(`~/.claude/skills` 등)를 대체합니다. 테스트/CI가 결정적 스킬 픽스처를 주입할 때 사용합니다. |
 | `HARNESS_MCP_TRIGGERS_CONFIG` | `mcp_triggers.json` 대체 경로입니다. |
 | `HARNESS_SKILL_ROUTES_CONFIG` | skill routing JSON 대체 경로입니다. |
 | `HARNESS_MCP_TRIGGERS_NO_CROSS_CHECK` | `1`로 설정하면 MCP 설정 cross-check를 비활성화합니다. |

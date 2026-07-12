@@ -7,11 +7,14 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const corpusPath = path.resolve(process.argv[2] ?? "testdata/incidents/langfuse-antigravity-corpus.json");
 const corpus = JSON.parse(fs.readFileSync(corpusPath, "utf-8"));
+const nonEmpty = (a) => Array.isArray(a) && a.length > 0;
 const enforceable = (corpus.entries ?? []).filter(
   (entry) =>
-    Array.isArray(entry.expected_rules_present) &&
-    Array.isArray(entry.expected_rules_absent) &&
-    (entry.expected_rules_present.length > 0 || entry.expected_rules_absent.length > 0),
+    nonEmpty(entry.expected_rules_present) ||
+    nonEmpty(entry.expected_rules_absent) ||
+    // Advisory (process_warnings) expectations also make an entry enforceable.
+    nonEmpty(entry.expected_process_warnings_present) ||
+    nonEmpty(entry.expected_process_warnings_absent),
 );
 
 if (enforceable.length === 0) {
@@ -73,6 +76,13 @@ try {
       }
       for (const rule of entry.expected_rules_absent ?? []) {
         assert.ok(!rules.has(rule), `${entry.id}: unexpected ${rule}, got ${[...rules].join(", ")}`);
+      }
+      const warns = new Set((result.process_warnings ?? []).map((w) => w.rule));
+      for (const rule of entry.expected_process_warnings_present ?? []) {
+        assert.ok(warns.has(rule), `${entry.id}: expected process_warning ${rule}, got ${[...warns].join(", ")}`);
+      }
+      for (const rule of entry.expected_process_warnings_absent ?? []) {
+        assert.ok(!warns.has(rule), `${entry.id}: unexpected process_warning ${rule}, got ${[...warns].join(", ")}`);
       }
       pass++;
     } catch (err) {

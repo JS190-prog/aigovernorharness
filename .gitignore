@@ -18,6 +18,14 @@ Thumbs.db
 *.lock
 tmp/
 
+# Python bytecode cache (e.g. from running the pack_audit fixture)
+__pycache__/
+*.pyc
+
 # Locally generated incident corpora may contain private trace context.
 testdata/incidents/*.local.json
 testdata/incidents/*.private.json
+
+# Deployment-specific evidence-hint supplement may contain local paths.
+# Ship only the .example.json; keep the live file local.
+config/evidence_hints.supplement.json

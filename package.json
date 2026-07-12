@@ -1,13 +1,14 @@
 {
   "name": "aigovernorharness",
-  "version": "1.0.0",
-  "description": "",
+  "version": "2.6.0",
+  "description": "AI Governor Harness — an MCP server that gates false-completion claims, phantom-path/script hallucinations, risky intents, and skill-first routing.",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
-    "test": "pnpm build && node scripts/mcp-smoke.mjs && node scripts/mcp-regression.mjs",
+    "test": "pnpm build && node scripts/mcp-smoke.mjs && node scripts/mcp-regression.mjs && node scripts/new-rules-smoke.mjs && node scripts/log-rotation-smoke.mjs && node scripts/runtime-check.mjs && node scripts/corpus-regression.mjs",
+    "test:spec": "pnpm build && node scripts/spec-pack-smoke.mjs",
     "corpus:build": "node scripts/build-langfuse-incident-corpus.mjs --limit 100 --max-per-rule 40",
     "corpus:test": "pnpm build && node scripts/corpus-regression.mjs"
   },
