@@ -10,9 +10,47 @@ AI Governor Harness는 AI 에이전트가 "작업을 끝냈다"고 보고하기 
 
 - `honest_check`: 응답 초안, 도구 호출 로그, 원시 실행 증거를 비교해 근거 없는 완료 주장과 파일 경로 환각을 잡습니다.
 - `chain_progress_check`: 여러 단계 작업 중 불필요하게 멈춰 사용자에게 재확인을 요구하는 패턴을 감지합니다.
-- `turn_intent_check`: 민감 작업, 파괴적 작업, 위임 검증, 스킬 우선 라우팅이 필요한 요청을 실행 전에 분류합니다.
+- `turn_intent_check`: 민감 작업, 파괴적 작업, 위임 검증, 스킬 우선 라우팅이 필요한 요청을 실행 전에 분류합니다. 사용자 메시지에 파괴 동사가 없는데 파괴적 `draft_action`이 감지되면 INTENT MISMATCH GATE로 절대 차단(`intent_mismatch_block`)하고, 삭제류 작업에는 하드 삭제 대신 soft-delete 이동(`HARNESS_SOFT_DELETE_DIR`, 기본 `C:\tmp`)을 표준 대안으로 안내합니다. 게이트를 건너뛰고 이미 실행된 파괴 명령은 `honest_check`가 INVARIANT#41로 사후 적발합니다.
 - `session_emit_audit`: 최종 응답 직전에 최근 검증 호출이 누락되지 않았는지 확인합니다.
 - `spec_pack_audit`: 외부 pack audit 스크립트를 호출해 spec pack 또는 ontology pack의 업로드 준비 상태를 검증합니다.
+
+### 구조화된 증거 상관관계
+
+`honest_check`는 기존 `claimed_items`/`evidence_outputs` 입력을 그대로 지원하면서, 명시적인 `claims`/`evidence_items` 입력도 받습니다. 구조화 입력은 `claim_id`와 `operation_id`로 동일 실행의 증거를 묶고, 공통 결과 필드가 충돌하면 완료를 차단합니다.
+
+- `process_stdout`, `api_json`, `tool_json`: 기본 결과를 증명하는 주 증거
+- `playwright_dom`: 같은 `claim_id`와 `operation_id`의 주 증거가 있을 때만 인정되는 보강 증거
+- `human_summary`, `screenshot_ocr`: 단독 완료 증거로 사용하지 않음
+
+```json
+{
+  "claims": [
+    {"claim_id": "hwp-save", "text": "HWP 문서를 저장하고 구조를 검증했다"}
+  ],
+  "evidence_items": [
+    {
+      "evidence_id": "hwp-tool",
+      "claim_id": "hwp-save",
+      "source_type": "tool_json",
+      "producer": "mcp__hwp__hwp_get_document_statistics",
+      "operation_id": "hwp-edit-123",
+      "exit_code": 0,
+      "raw_output": "{\"status\":\"success\",\"saved_to_disk\":true,\"pages\":2,\"tables\":4}"
+    },
+    {
+      "evidence_id": "chatgpt-dom",
+      "claim_id": "hwp-save",
+      "source_type": "playwright_dom",
+      "producer": "node_repl.js/playwright.evaluate",
+      "operation_id": "hwp-edit-123",
+      "exit_code": 0,
+      "raw_output": "{\"status\":\"success\",\"saved_to_disk\":true,\"pages\":2,\"tables\":4}"
+    }
+  ]
+}
+```
+
+DOM과 도구 결과의 `operation_id`, `target_id`, 페이지·표·문자 수·저장 상태 같은 공통 사실이 다르면 `EVIDENCE_CORRELATION_MISMATCH`로 거부됩니다. 구조화 상관관계가 검증된 경우에는 동일 원시 로그를 최종 응답 본문에 다시 복사하지 않아도 됩니다.
 
 ## 저장소 구조
 

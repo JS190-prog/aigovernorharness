@@ -12,11 +12,13 @@ import {
   isLocalCompletionTier,
   hasStrongEvidence,
   hasTieredStrongEvidence,
-  evidenceIsStrong,
+  evidenceIsStrongForClaim,
+  STRUCTURED_EVIDENCE_SOURCE_TYPES,
+  correlateStructuredEvidence,
 } from "./evidence.js";
 
 const SCRIPT_EXT_GROUP = "py|sh|ts|mjs|cjs|js|ps1|bat|cmd|rb|go|rs";
-const SCRIPT_EXEC_VERBS = "실행|통해|사용하여|돌려|동작|구동|기동|호출|호출하여|invok\\w*|ran|run|running|executed|execute|executing|via|using|through";
+const SCRIPT_EXEC_VERBS = "실행|통해|사용하여|돌려|동작|구동|기동|호출|호출하여|\\b(?:invok\\w*|ran|run|running|executed|execute|executing|via|using|through)\\b";
 
 const SEARCH_ROOTS_DEFAULT = [
   path.join(os.homedir(), ".gemini"),
@@ -283,10 +285,13 @@ const SKILL_ROUTE_MAP: SkillRouteEntry[] = loadSkillRoutes();
 const ANTIGRAVITY_ROOT =
   process.env.ANTIGRAVITY_ROOT ?? DEFAULT_ANTIGRAVITY_ROOT;
 // HARNESS_STATE_DIR 로 상태 디렉토리를 분리할 수 있다(테스트 격리용). 미설정 시
-// 기존 동작(<ANTIGRAVITY_ROOT>/state)을 그대로 유지하므로 프로덕션 런타임은 변화 없음.
-// 회귀/스모크 테스트가 이 변수를 임시 디렉토리로 주입하면, 테스트의 resetState/append 가
-// 더 이상 실제 honest_check_calls.jsonl / honest_check_pending.json 을 삭제·오염하지 않는다.
-const STATE_DIR = process.env.HARNESS_STATE_DIR ?? path.join(ANTIGRAVITY_ROOT, "state");
+// 하네스 저장소가 소유하는 runtime/state를 사용해 폐기된 Antigravity 상태 경로를
+// 다시 만들지 않는다. 회귀/스모크 테스트는 이 변수를 임시 디렉토리로 주입해
+// 실제 honest_check_calls.jsonl / honest_check_pending.json 을 오염하지 않는다.
+const STATE_DIR = process.env.HARNESS_STATE_DIR ?? path.join(HARNESS_ROOT, "runtime", "state");
+// P2-1 (2026-07-17 plan): soft-delete 대상 디렉터리. 지시문에 박혀 있던 배포 고유
+// 경로(C:\tmp)를 env 로 외부화 — 미설정 시 기존 기본값 유지라 런타임 변화 없음.
+const SOFT_DELETE_DIR = process.env.HARNESS_SOFT_DELETE_DIR ?? "C:\\tmp";
 const HONEST_CALL_LOG = path.join(STATE_DIR, "honest_check_calls.jsonl");
 // Rotation threshold. Defaults to 5MB; overridable via HARNESS_HONEST_LOG_MAX_BYTES
 // so tests can force rotation cheaply (mirrors the HARNESS_STATE_DIR injection).
@@ -310,11 +315,12 @@ interface HonestCallEntry {
 
 // Keep only the newest HONEST_CALL_LOG_BAK_KEEP rotated `.bak` files so the
 // state dir doesn't accumulate one backup per rotation forever. (P2-5)
+// 2026-07-17 P2-4: parametrized so the intent-check log shares the same policy.
 const HONEST_CALL_LOG_BAK_KEEP = 3;
-function pruneRotatedLogs(): void {
+function pruneRotatedLogs(target: string = HONEST_CALL_LOG): void {
   try {
-    const dir = path.dirname(HONEST_CALL_LOG);
-    const base = path.basename(HONEST_CALL_LOG);
+    const dir = path.dirname(target);
+    const base = path.basename(target);
     const baks = fs
       .readdirSync(dir)
       .filter((name) => name.startsWith(`${base}.`) && name.endsWith(".bak"))
@@ -333,6 +339,24 @@ function pruneRotatedLogs(): void {
   }
 }
 
+// Shared size-rotated JSONL append (P2-4). Rotation threshold and .bak retention
+// mirror the original honest_check log behavior exactly.
+function appendRotatingLog(target: string, entry: unknown): void {
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    if (fs.existsSync(target)) {
+      const st = fs.statSync(target);
+      if (st.size > HONEST_CALL_LOG_MAX_BYTES) {
+        fs.renameSync(target, target + `.${Date.now()}.bak`);
+        pruneRotatedLogs(target); // P2-5: keep only the newest few .bak rotations
+      }
+    }
+    fs.appendFileSync(target, JSON.stringify(entry) + "\n", "utf-8");
+  } catch (err) {
+    console.error(`[harness] ${path.basename(target)} log error: ${(err as Error).message}`);
+  }
+}
+
 function logHonestCheckCall(
   sessionId: string,
   verdict: string,
@@ -343,30 +367,39 @@ function logHonestCheckCall(
   resultVerdict?: "HONEST" | "WEAK" | "DECEPTIVE",
   processVerdict?: "HONEST" | "WEAK" | "DECEPTIVE",
 ): void {
-  try {
-    fs.mkdirSync(path.dirname(HONEST_CALL_LOG), { recursive: true });
-    if (fs.existsSync(HONEST_CALL_LOG)) {
-      const st = fs.statSync(HONEST_CALL_LOG);
-      if (st.size > HONEST_CALL_LOG_MAX_BYTES) {
-        fs.renameSync(HONEST_CALL_LOG, HONEST_CALL_LOG + `.${Date.now()}.bak`);
-        pruneRotatedLogs(); // P2-5: keep only the newest few .bak rotations
-      }
-    }
-    const entry: HonestCallEntry = {
-      ts: new Date().toISOString(),
-      session_id: sessionId || "default",
-      verdict,
-      violation_count: violationCount,
-      violation_rules: violationRules.length > 0 ? violationRules.slice(0, 10) : undefined,
-      claim_hash: claimHashValue,
-      evidence_hash: evidenceHashValue,
-      result_verdict: resultVerdict,
-      process_verdict: processVerdict,
-    };
-    fs.appendFileSync(HONEST_CALL_LOG, JSON.stringify(entry) + "\n", "utf-8");
-  } catch (err) {
-    console.error(`[harness] honest_check log error: ${(err as Error).message}`);
-  }
+  const entry: HonestCallEntry = {
+    ts: new Date().toISOString(),
+    session_id: sessionId || "default",
+    verdict,
+    violation_count: violationCount,
+    violation_rules: violationRules.length > 0 ? violationRules.slice(0, 10) : undefined,
+    claim_hash: claimHashValue,
+    evidence_hash: evidenceHashValue,
+    result_verdict: resultVerdict,
+    process_verdict: processVerdict,
+  };
+  appendRotatingLog(HONEST_CALL_LOG, entry);
+}
+
+// P2-4 (2026-07-17 plan): turn_intent_check 호출 기록. INTENT MISMATCH GATE 의
+// 오탐/미탐율을 코퍼스로 측정할 수 있게 하는 관측성 로그 — honest_check 로그와
+// 동일한 로테이션 정책을 공유한다.
+const INTENT_CALL_LOG = path.join(STATE_DIR, "intent_check_calls.jsonl");
+function logIntentCheckCall(
+  sessionId: string,
+  intent: string,
+  riskRules: string[],
+  mismatchBlock: boolean,
+  suppressedBy: string | null,
+): void {
+  appendRotatingLog(INTENT_CALL_LOG, {
+    ts: new Date().toISOString(),
+    session_id: sessionId || "default",
+    intent,
+    risk_rules: riskRules.slice(0, 10),
+    intent_mismatch_block: mismatchBlock,
+    intent_mismatch_suppressed_by: suppressedBy,
+  });
 }
 
 function readRecentHonestCalls(sessionId: string, windowMinutes: number): HonestCallEntry[] {
@@ -574,9 +607,23 @@ function loadSessionPending(session_id: string): PendingState | null {
   return store[session_id] ?? null;
 }
 
+// P1-4 (2026-07-17 plan): auto-<pid> 세션은 프로세스 종료 후 HONEST-clear 경로가
+// 영원히 실행되지 않아 pending 엔트리가 좀비로 남는다 (배포 상태 실측: 40일 묵은
+// 9건). 쓰기 시점 lazy pruning — 별도 타이머/데몬 불필요. 타임스탬프가 깨진
+// 엔트리도 함께 제거한다.
+const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+function prunePendingStore(store: PendingStore): void {
+  const cutoff = Date.now() - PENDING_TTL_MS;
+  for (const [sid, st] of Object.entries(store)) {
+    const t = Date.parse(st?.first_blocked_at ?? st?.created_at ?? "");
+    if (Number.isNaN(t) || t < cutoff) delete store[sid];
+  }
+}
+
 function saveSessionPending(session_id: string, state: PendingState | null): boolean {
   const result = withPendingLock(() => {
     const store = loadPendingStore();
+    prunePendingStore(store); // P1-4: lazy TTL cleanup on every write
     if (state === null) {
       delete store[session_id];
     } else {
@@ -596,13 +643,53 @@ function clearSessionPending(session_id: string): boolean {
   return saveSessionPending(session_id, null);
 }
 
-// Intent classification for turn_intent_check.
-// SESSION_CLOSE_RE matches session-end intent; SESSION_CLOSE_NEG_RE strips
-// technical-context phrases like '파일 종료' / '프로세스 종료' / '탭 종료' as well
-// as work-transition phrases like '마무리 단계로 가자' that are NOT session-end.
-const SESSION_CLOSE_RE = /(?:^|[\s,.])((세션\s*)?(종료|마무리|마무리하자|마무리해|끝|다\s*했어|작업\s*완료|작업\s*다\s*했)|end\s*session|stop\s*session|wrap\s*up|exit\s*session)(?:[\s,.!?]|$)/i;
-const SESSION_CLOSE_NEG_RE =
-  /(파일|프로세스|process|service|connection|task|컨테이너|container|함수|스레드|thread|클라이언트|client|서버|server|수신|read|stream|소켓|socket|채널|channel|핸들|handle|루프|loop|탭|tab|팝업|popup|창|window|터미널|terminal|pty|child\s*process|job|browser\s*context|세션\s*파일|file\s*handle)\s*(종료|끝|마무리|닫기|close)|마무리\s*(단계|작업|후|할\s*일|할\s*거|할거|짓기|짓자)|마지막\s*단계/i;
+// ── P1-3 (2026-07-17 plan): 다중 턴 승인 인식용 destructive-intent 세션 이력 ──
+// 사용자가 파괴 동사를 말한 시각을 세션 키로 기록해 두면, 다음 턴 "응 진행해"처럼
+// 파괴 동사 없는 승인 메시지에서도 INTENT MISMATCH 절대 차단을 통상 승인 게이트로
+// 강등시킬 수 있다. 완전 통과가 아니다 — destructive_* risk_signals 와 승인 요구
+// instructions 는 그대로 유지되고, 절대 차단만 억제된다(감사 필드
+// intent_mismatch_suppressed_by 로 노출).
+const DESTRUCTIVE_INTENT_TTL_MS = 15 * 60 * 1000;
+const DESTRUCTIVE_INTENT_PATH = path.join(STATE_DIR, "destructive_intent.json");
+
+interface DestructiveIntentEntry {
+  ts: string;
+  matched: string;
+}
+
+function loadDestructiveIntent(session_id: string): DestructiveIntentEntry | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(DESTRUCTIVE_INTENT_PATH, "utf-8")) as Record<
+      string,
+      DestructiveIntentEntry
+    >;
+    const entry = raw?.[session_id];
+    if (!entry) return null;
+    const t = Date.parse(entry.ts);
+    if (Number.isNaN(t) || Date.now() - t > DESTRUCTIVE_INTENT_TTL_MS) return null;
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+function saveDestructiveIntent(session_id: string, matched: string): void {
+  withPendingLock(() => {
+    let store: Record<string, DestructiveIntentEntry> = {};
+    try {
+      store = JSON.parse(fs.readFileSync(DESTRUCTIVE_INTENT_PATH, "utf-8")) ?? {};
+    } catch {
+      store = {};
+    }
+    const cutoff = Date.now() - DESTRUCTIVE_INTENT_TTL_MS;
+    for (const [sid, entry] of Object.entries(store)) {
+      const t = Date.parse(entry?.ts ?? "");
+      if (Number.isNaN(t) || t < cutoff) delete store[sid];
+    }
+    store[session_id] = { ts: new Date().toISOString(), matched: matched.slice(0, 40) };
+    return atomicWriteJson(DESTRUCTIVE_INTENT_PATH, store);
+  });
+}
 
 // (2026-05-31) Short-reply approve/reject classification removed: the harness no
 // longer asks the user 예/아니오 to confirm a blocked completion claim. honest_check
@@ -654,8 +741,10 @@ function detectStopAndAsk(text: string): { rule: string; matched: string }[] {
 
 // Risk signals — flagged so the model can request approval per CLAUDE.md guards.
 const RISK_PATTERNS: { rule: string; pattern: RegExp; reason: string }[] = [
-  { rule: "destructive_filesystem", pattern: /(rm\s+-rf|Remove-Item\s+-Recurse\s+-Force|rmdir\s+\/s)/i, reason: "Recursive filesystem deletion" },
-  { rule: "destructive_db", pattern: /(DROP\s+TABLE|TRUNCATE|DETACH\s+DELETE|deleteMany\(\{\}\)|drop\(\)|reset\(\))/i, reason: "Destructive database operation" },
+  // P2-2 (2026-07-17 plan): rd /s·del /f·git clean -f(dry-run -n 은 미발화)·
+  // Format-Volume/format X: 추가. 각 패턴은 회귀 양/음성 쌍으로 고정.
+  { rule: "destructive_filesystem", pattern: /(rm\s+-rf|Remove-Item\s+-Recurse\s+-Force|rmdir\s+\/s|rd\s+\/s|del\s+\/[fsq]|git\s+clean\s+-[a-z]*f[a-z]*|Format-Volume|\bformat\s+[a-z]:)/i, reason: "Recursive filesystem deletion" },
+  { rule: "destructive_db", pattern: /(DROP\s+(?:TABLE|DATABASE|SCHEMA)|TRUNCATE|DETACH\s+DELETE|deleteMany\(\{\}\)|drop\(\)|reset\(\))/i, reason: "Destructive database operation" },
   { rule: "destructive_git", pattern: /(git\s+push\s+--force|force\s*push|git\s+reset\s+--hard|--no-verify)/i, reason: "Destructive git operation" },
   { rule: "destructive_docker", pattern: /(docker\s+(volume\s+rm|volume\s+prune|system\s+prune\s+-a))/i, reason: "Docker volume/system destruction" },
   { rule: "secret_dump", pattern: /(cat\s+\.env|Get-Content\s+\.env|type\s+\.env|credentials\.json)/i, reason: "Potentially exposing secrets to stdout" },
@@ -676,8 +765,54 @@ const SCOPE_DRIFT_DELETE_RE = /(?:os\.remove|os\.unlink|shutil\.rmtree|Remove-It
 // Non-destructive intents that should NOT lead to deletion. "정리"(tidy) is
 // deliberately excluded — it often legitimately includes deletion.
 const RENAME_ANALYSIS_INTENT_RE = /(이름\s*(?:을|를)?\s*(?:변경|바꿔|바꾸)|rename|파일\s*명|분석|확인|조회)/i;
+// Destructive-intent verb cores (P2-3, 2026-07-17 plan): EXPLICIT_DELETE_INTENT_RE
+// is the narrow deletion-verb subset used by scope-drift; DESTRUCTIVE_INTENT_RE is
+// the broad set used by the INTENT MISMATCH GATE. Deriving both from DELETE_INTENT_VERBS
+// keeps the narrow set a subset of the broad set by construction (no drift —
+// STOP_AND_ASK_RE unification precedent).
+const DELETE_INTENT_VERBS = "삭제|지워|지우|없애|제거|remove|delete";
 // If the user explicitly asked to delete, deletion is in-scope — not drift.
-const EXPLICIT_DELETE_INTENT_RE = /(삭제|지워|지우|없애|제거|remove|delete)/i;
+const EXPLICIT_DELETE_INTENT_RE = new RegExp(`(${DELETE_INTENT_VERBS})`, "i");
+
+// ── INTENT_MISMATCH_DESTRUCTIVE (2026-07-17 추가 — 2026-05-09 사고 회귀 가드) ──
+// 배경: 사용자의 직전 메시지에 파괴 동사가 전혀 없는데(예: "1->2->4->3->5로
+// 승인할께") 모델이 Remove-Item -Recurse -Force 류의 파괴 명령을 draft_action 으로
+// 시도하는 패턴이 반복 관측됨. draft_action 에 destructive_* RISK_PATTERNS 가
+// 잡혔는데 user_request 에 아래 파괴 의도 동사가 하나도 없으면, 승인 유도가 아니라
+// 절대 차단(intent_mismatch_block)으로 응답한다. "정리/청소"는 scope-drift 규칙과
+// 같은 이유로 파괴 의도로 인정한다(합법적 삭제를 자주 포함).
+const DESTRUCTIVE_INTENT_RE = new RegExp(
+  `(${DELETE_INTENT_VERBS}|비워|날려|밀어|정리|청소|초기화|리셋|롤백|되돌리|덮어쓰|drop|truncate|wipe|purge|clean|clear|reset|prune|rollback|revert|overwrite|uninstall|destroy|force\\s*push|\\brm\\b)`,
+  "i",
+);
+
+// P1-1 (2026-07-17 plan): draft_action 은 실행 의도 원문이지만, 그 안의 "데이터
+// 인자"(커밋 메시지 본문, echo 출력 문자열)는 명령이 아니라 데이터다. 실사고:
+// 사고 설명용 커밋 메시지에 적힌 파괴 명령 문자열이 INTENT_MISMATCH 를 오발화.
+// 알려진 데이터 싱크의 문자열 인자만 제거한다 — 범용 stripCodeAndQuotes 를 쓰면
+// `Remove-Item "C:\path with space"` 의 인자 따옴표까지 지워져 미탐이 생긴다.
+const QUOTED_ARG_SRC = `"(?:[^"\\\\]|\\\\.)*"|'[^']*'`;
+const DATA_SINK_CMD_RE = /\b(?:git\s+(?:commit|tag)|gh\s+(?:pr|issue|release)\s+\w+)\b/i;
+const DATA_SINK_FLAG_RE = new RegExp(
+  `(\\s(?:-m|-b|--message|--body|--title|--notes)[=\\s]+)(?:${QUOTED_ARG_SRC})`,
+  "gi",
+);
+// echo/printf/Write-Output 의 문자열 인자는 stdout 싱크 — 단, 파일 리다이렉트가
+// 뒤따르면 실행물 생성일 수 있으므로 스트립하지 않는다.
+const STDOUT_SINK_RE = new RegExp(
+  `\\b(echo|printf|Write-Output|Write-Host)\\s+(?:${QUOTED_ARG_SRC})(?![^\\n]*(?:>|\\|\\s*(?:Out-File|Set-Content|Add-Content|Tee-Object)))`,
+  "gi",
+);
+function stripDataSinkArgs(action: string): string {
+  let out = action;
+  if (DATA_SINK_CMD_RE.test(out)) {
+    out = out.replace(DATA_SINK_FLAG_RE, "$1<data>");
+    // 커밋 메시지를 heredoc 으로 넘기는 형태: git commit -m "$(cat <<'EOF' … EOF)"
+    out = out.replace(/<<\s*'?(\w+)'?[\s\S]*?\r?\n\1\b/g, "<heredoc>");
+  }
+  out = out.replace(STDOUT_SINK_RE, "$1 <data>");
+  return out;
+}
 
 // ACTIVE_HALLUCINATION_ALERT.md is continuously re-created by the hallucination
 // watchdog daemon even after manual removal. If it is the ONLY active alert
@@ -805,17 +940,6 @@ const RESPONSE_RULES: PatternRule[] = [
       "Claims that a script was executed must be backed by quoted stdout AND the script's existence verified. Phantom-script reports (e.g. 'cleanup_materials.py를 통해 제거') are how false-completion incidents start.",
   },
   {
-    // Detects manually-fabricated session-end summaries (e.g. model writes its own
-    // run_session_end JSON block after guard returned BLOCK). The tell-tale is
-    // a '세션 종료 결산' or fake JSON with 'status':'Success' appearing in the
-    // same response that also contains a guard BLOCK signal.
-    pattern: /(세션\s*종료\s*결산|자동\s*실행기\s*출력)[\s\S]{0,200}["']status["']\s*:\s*["'](Success|Partial|완료)["']/i,
-    rule: "INVARIANT#16_FAKE_SESSION_END",
-    severity: "CRITICAL",
-    description:
-      "Model fabricated a run_session_end.py JSON output. The session-end block must be produced by actually running run_session_end.py and quoting its stdout — never hand-written. If guard_completion returned BLOCK, the session-end claim is forbidden until the block is resolved.",
-  },
-  {
     // Detects false MCP activation claims: model says 'MCP 활성화 완료' or
     // 'MCP로 검색했다' without an actual mcp__ tool call in evidence.
     // Evidence strings from real MCP calls contain 'mcp__' prefixed tool names.
@@ -921,9 +1045,6 @@ const BUILTIN_EVIDENCE_HINTS: Record<string, string[]> = {
   "INVARIANT#15_PHANTOM_SCRIPT": [
     "Execute the script and quote stdout (`exit 0`), OR remove the execution claim and label as 'proposed'.",
   ],
-  "INVARIANT#16_FAKE_SESSION_END": [
-    "Run `python run_session_end.py` and paste the JSON stdout literally. Do not hand-write the session-end block.",
-  ],
   "INVARIANT#17_PHANTOM_MCP_CALL": [
     "Make a real `mcp__<server>__<tool>` tool call. auto_mcp.py only configures — it does not execute searches.",
   ],
@@ -950,7 +1071,13 @@ const BUILTIN_EVIDENCE_HINTS: Record<string, string[]> = {
     "Cite `raw/*.raw.md`, `diarized/*.diarized.md`, `progress.json`, and `speaker_roster.md` before declaring transcription complete.",
   ],
   "WEAK_EVIDENCE": [
-    "For each claimed_item, provide raw stdout/diff/Read excerpt (≥20 chars, with tool tokens like 'exit 0', 'lines', 'bytes', 'PASS') — not narrative.",
+    "For a completed claimed_item, provide raw success stdout/diff/Read evidence (≥20 chars, such as exit 0, PASS, lines, or bytes). For an explicitly failed/blocked/unresolved claimed_item, provide raw machine-readable failure status, nonzero exit code, false readiness flag, or unresolved count. Never invent PASS/exit 0 for a negative claim.",
+  ],
+  "EVIDENCE_CORRELATION_WEAK": [
+    "Attach at least one strong primary process_stdout/api_json/tool_json item to each claim_id. Completed claims need positive success evidence; failed/blocked/unresolved claims need machine-readable negative evidence. Playwright DOM is corroborating evidence only and requires the same operation_id.",
+  ],
+  "EVIDENCE_CORRELATION_MISMATCH": [
+    "Do not combine different operation_id/target_id values. Re-read the primary tool/API result and browser DOM from the same operation, then resolve every conflicting fact before retrying.",
   ],
   "INVARIANT#26_DELEGATED_VERIFICATION_BYPASS": [
     "사용자가 지정한 CLI로 실제 검증/작업을 실행하세요: 예) `codex exec --skip-git-repo-check -s read-only \"<대상> 검증해줘\"`, `codex review`, 또는 `gemini -p \"...\"`. `codex doctor`/`--help`/다른 MCP(session_emit_audit·audit.py)로의 대체는 위임 이행이 아닙니다.",
@@ -980,13 +1107,6 @@ const BUILTIN_EVIDENCE_HINTS: Record<string, string[]> = {
     "REMOVE the stop-and-ask sentence ('이어서 진행할까요?', 'shall I continue?', etc.) from your draft. The user already approved the multi-step task — auto-chain to the next step immediately.",
     "If the operation has hang risk (large file walk, browser MCP, external API, long-running script), split it into chunks ≤1–2 min wall-clock each. Emit a one-line progress note between chunks; never pause for user confirmation between chunks.",
     "Only pause for: (a) genuine inability to proceed (missing file, auth error), (b) destructive-action approval per CLAUDE.md, or (c) ambiguous user intent that materially changes the plan.",
-  ],
-  // INVARIANT#29_CLOSEOUT_PROTOCOL_SKIPPED (2026-06-08 추가)
-  // 배경: '종료' 명령 시 run_session_end.py 미실행 후 단순 텍스트로 마감한 사례
-  "INVARIANT#29_CLOSEOUT_PROTOCOL_SKIPPED": [
-    "사용자가 '종료'/'세션 종료'/'session close' 명령을 내렸습니다. GEMINI.md Closeout 룰에 따라 반드시 `python run_session_end.py --session-title \"<title>\" ...` 를 실행하고 그 JSON stdout을 응답에 인용해야 합니다.",
-    "단순 텍스트로 '종료합니다'만 응답하는 것은 프로토콜 위반입니다. run_session_end.py 실행 후 quality_check.py 까지 수행하고 스코어를 보고하세요.",
-    "이 규칙은 2026-06-07 '종료' 명령 시 run_session_end.py 미실행 후 단순 텍스트 응답으로 마감한 사례에서 추가되었습니다.",
   ],
   // INVARIANT#30_FABRICATED_DIARIZATION (2026-06-11 추가, trace 74cb9bd1)
   // 배경: 모델이 pyannote를 실행하지 않고 하드코딩 python 스크립트로
@@ -1046,6 +1166,10 @@ const BUILTIN_EVIDENCE_HINTS: Record<string, string[]> = {
     "Before any OpenCrab create/update/link/upload/ingest action, confirm and include purpose plus all nine 9space axes: subject, resource, evidence, concept, claim, community, outcome, lever, policy.",
     "Do not treat workspace_label, package title, or project name as the full 9space. They are slugs/names only.",
     "Redo or repair the operation only after the user confirms the full purpose and all nine axes; quote that confirmation and the mutating tool input evidence.",
+  ],
+  "INVARIANT#41_INTENT_MISMATCH_EXECUTED": [
+    `사용자 직전 메시지에 파괴 동사가 없는데 파괴 명령이 이미 실행됐습니다. 완료 보고 전에 무엇이 삭제/변경됐는지 목록과 복구 경로(백업, ${SOFT_DELETE_DIR} 이동본, 휴지통)를 먼저 보고하세요.`,
+    "복구 가능하면 즉시 복구하거나 복구 명령을 제시하고, 사용자가 해당 파괴 작업을 실제로 원했는지 확인 받은 뒤에만 재시도하세요.",
   ],
   "INVARIANT#40_OPENCRAB_NEO4J_LINEAGE_UNVERIFIED": [
     "For OpenCrab full/high-quality/Neo4j-linked ingest claims, quote read-only Neo4j evidence that maps package_id, workspace_id, source_title, and a document/chunk/source locator.",
@@ -1504,7 +1628,7 @@ function activeAlertStatus() {
 function isPartialStatusRewrite(text: string): boolean {
   return (
     /^STATUS:\s*PARTIAL_STATUS\b/i.test(text.trim()) &&
-    /(미실행|실패|미검증|완료\s*\(\s*evidence\b)/i.test(text)
+    /(?:미완료|미실행|실패|차단|보류|미검증|완료되지|해결되지|남아\s*(?:있|있음)|남음|완료\s*\(\s*evidence\b|\bfailed\b|\bblocked\b|\bunresolved\b|\bincomplete\b|\bunverified\b|\bnot\s+(?:run|completed|ready)\b|\bremaining\b)/i.test(text)
   );
 }
 
@@ -1654,6 +1778,54 @@ function scanBuildArtifactDirectPatch(text: string, toolCallLog: string): Violat
         "lost on the next build).",
     },
   ];
+}
+
+// ── INVARIANT#41_INTENT_MISMATCH_EXECUTED (2026-07-17 plan P1-2) ──
+// 사전 게이트(turn_intent_check INTENT MISMATCH GATE)는 모델이 호출해야만 작동한다.
+// 게이트를 건너뛰고 파괴 명령을 이미 실행해 버린 경우를 honest_check 가 사후 적발한다:
+// tool_call_log 의 실행 레코드 라인에 destructive_* 패턴 매치 + 사용자 파괴 의도 부재
+// (직전 메시지와 P1-3 15분 세션 이력 모두) → CRITICAL (process verdict).
+//
+// 오탐 가드 2중: (1) 실행 마커가 있는 그 라인만 스캔한다 — Read/view_file 출력에
+// 인용된 파괴 문자열(다음 라인들)은 실행이 아니다 (INVARIANT#30 근접 매칭 전례).
+// (2) 커밋 메시지 본문 등 데이터 인자는 stripDataSinkArgs 로 제거 후 매칭한다(P1-1 공유).
+const EXEC_RECORD_MARKER_RE =
+  /(run_command|run_shell_command|exec_command|executing command:|shell_exec|\b(?:Bash|PowerShell)\b\s*[:(])/gi;
+
+function scanIntentMismatchExecuted(
+  userRequest: string,
+  toolCallLog: string,
+  sessionId: string,
+): Violation[] {
+  if (!toolCallLog || !userRequest.trim()) return [];
+  if (DESTRUCTIVE_INTENT_RE.test(stripCodeAndQuotes(userRequest))) return [];
+  if (loadDestructiveIntent(sessionId)) return [];
+  EXEC_RECORD_MARKER_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = EXEC_RECORD_MARKER_RE.exec(toolCallLog)) !== null) {
+    const lineEnd = toolCallLog.indexOf("\n", m.index);
+    const line = stripDataSinkArgs(
+      toolCallLog.slice(m.index, lineEnd === -1 ? m.index + 500 : Math.min(lineEnd, m.index + 500)),
+    );
+    for (const r of RISK_PATTERNS) {
+      if (!r.rule.startsWith("destructive_")) continue;
+      const hit = line.match(r.pattern);
+      if (hit) {
+        return [
+          {
+            rule: "INVARIANT#41_INTENT_MISMATCH_EXECUTED",
+            severity: "CRITICAL",
+            matched: `${r.rule}: ${hit[0].slice(0, 60)}`,
+            description:
+              "tool_call_log 에 파괴적 명령 실행 기록이 있으나 사용자 요청(직전 메시지·최근 15분 세션 이력)에는 " +
+              "파괴 동사가 없습니다. 사용자가 지시하지 않은 파괴 작업이 이미 실행됐습니다 — 완료 보고 대신 " +
+              `무엇이 삭제/변경됐는지와 복구 가능 여부(백업·휴지통·${SOFT_DELETE_DIR} 이동본)를 정확히 보고하고 사용자 확인을 받으세요.`,
+          },
+        ];
+      }
+    }
+  }
+  return [];
 }
 
 // ── INVARIANT#38_SKILL_METHOD_BYPASS (2026-06-20 추가 — 나은이네 이미지 사건) ──
@@ -1845,6 +2017,18 @@ function routeKeywordAppears(haystack: string, keyword: string): boolean {
   return haystack.includes(kLower);
 }
 
+function genericMcpRouteIsShadowed(haystack: string, keyword: string): boolean {
+  if (keyword.toLowerCase() !== "mcp") return false;
+  return /\b(?:ai[-_\s]?governor[-_\s]?harness|honest[_\s-]?check)\b|하네스\s*mcp|mcp\s*하네스/i.test(haystack);
+}
+
+function releaseArtifactIntentShadowsCadRoute(haystack: string, keyword: string): boolean {
+  if (!/^(?:cad|캐드)$/i.test(keyword)) return false;
+  const releaseIntent = /(?:운영\s*)?(?:배포|게시)|릴리스|release|publish|promotion|promote|버전|version|sha(?:256)?|manifest|installer|latest|stable|edge/i;
+  const cadWorkTarget = /cad\s*(?:파일|도면)|캐드\s*(?:파일|도면)|도면|dwg|dxf|오토캐드|autocad|model\s*space|레이어|블록|엔티티|치수|좌표|형상|geometry/i;
+  return releaseIntent.test(haystack) && !cadWorkTarget.test(haystack);
+}
+
 function skillMdPath(name: string): string | null {
   for (const root of skillRoots()) {
     const candidate = path.join(root, name, "SKILL.md");
@@ -1911,6 +2095,13 @@ function detectSkillTriggers(text: string): SkillTriggerHit[] {
       // use them as document-type triggers.
       if (keyword.length < 2) continue;
       if (!routeKeywordAppears(lower, keyword)) continue;
+      // A generated catch-all `mcp` route must not override an explicitly
+      // named harness tool. Harness maintenance follows its own fixed source
+      // contract, not the generic MCP builder/orchestrator workflow.
+      if (genericMcpRouteIsShadowed(lower, keyword)) continue;
+      // A release matrix such as "Agent, CAD, LocalCode 운영 배포" names CAD as
+      // an artifact, not as a request to inspect or edit a drawing.
+      if (releaseArtifactIntentShadowsCadRoute(lower, keyword)) continue;
       for (const skill of route.skills) add(skill, keyword, "route");
     }
   }
@@ -1972,6 +2163,47 @@ function stripCodeAndQuotes(text: string): string {
     .replace(/[‘’][^‘’\n]+[‘’]/g, "");
 }
 
+// A script filename can be mentioned to disclose preserved/foreign work rather
+// than to claim that the script exists or ran. Treat only the local sentence as
+// negated so a separate positive script claim in the same response is still
+// audited. This fixes the false PHANTOM_SCRIPT hit on reports such as
+// "build_connector_runtime_bundles.ps1 변경은 건드리지 않았다".
+function isNegatedScriptCitation(text: string, start: number, end: number): boolean {
+  const leftBoundary = Math.max(
+    text.lastIndexOf("\n", start - 1),
+    text.lastIndexOf(".", start - 1),
+    text.lastIndexOf("!", start - 1),
+    text.lastIndexOf("?", start - 1),
+  );
+  const rightCandidates = ["\n", ".", "!", "?"]
+    .map((token) => text.indexOf(token, end))
+    .filter((index) => index >= 0);
+  const rightBoundary = rightCandidates.length > 0 ? Math.min(...rightCandidates) : text.length;
+  const sentence = text.slice(leftBoundary + 1, rightBoundary);
+  return /(?:건드리|수정|변경|실행|호출|사용|삭제|제거|커밋|포함)[^\r\n.!?]{0,24}(?:않|안\s|못|미실행|제외|보존)|(?:미실행|제외|보존|그대로\s*둠)|(?:did\s+not|didn't|not)\s+(?:touch|modify|change|run|execute|invoke|use|delete|remove|commit|include)|\b(?:untouched|unchanged|excluded|preserved)\b/i.test(sentence);
+}
+
+// Bundled JavaScript files are also deployment artifacts. When every structured
+// claim is already bound to strong primary evidence, a local sentence that only
+// reports an artifact hash/readback is not a claim that the file was executed as
+// a script. Keep this deliberately narrow so ordinary bare script citations are
+// still checked for existence.
+function isVerifiedArtifactReadbackCitation(text: string, start: number, end: number): boolean {
+  const leftBoundary = Math.max(
+    text.lastIndexOf("\n", start - 1),
+    text.lastIndexOf("!", start - 1),
+    text.lastIndexOf("?", start - 1),
+  );
+  // Do not use a period as a boundary: the citation itself contains one
+  // (`admin.js`), which would split the readback sentence before its hash result.
+  const rightCandidates = ["\n", "!", "?"]
+    .map((token) => text.indexOf(token, end))
+    .filter((index) => index >= 0);
+  const rightBoundary = rightCandidates.length > 0 ? Math.min(...rightCandidates) : text.length;
+  const sentence = text.slice(leftBoundary + 1, rightBoundary);
+  return /(?:hash|checksum|digest|해시)[^\r\n.!?]{0,60}(?:match(?:es|ed)?|identical|same|일치)|(?:readback|원격\s*(?:조회|검증))[^\r\n.!?]{0,60}(?:hash|checksum|digest|해시)/i.test(sentence);
+}
+
 // Path comparison normalization. The same file can appear in prose as a
 // Windows backslash path (`C:\Users\…\chunker.py`) while the tool_call_log
 // surfaces it as a forward-slash file:// URI
@@ -2006,7 +2238,7 @@ function scanText(
     const match = haystack.match(rule.pattern);
     if (!match) continue;
 
-    if (rule.rule === "INVARIANT#5" && strongEvidence) continue;
+    if (rule.rule === "INVARIANT#5" && (strongEvidence || partialStatusRewrite)) continue;
     if (rule.rule === "INVARIANT#15_PHANTOM_SCRIPT" && strongEvidence) continue;
     if (rule.rule === "INVARIANT#23_SPEC_PACK_UNVERIFIED" && strongEvidence) continue;
 
@@ -2081,6 +2313,22 @@ function scanText(
 
 type HonestVerdict = "HONEST" | "WEAK" | "DECEPTIVE";
 
+const StructuredClaimSchema = z.object({
+  claim_id: z.string().min(1),
+  text: z.string().min(1),
+});
+
+const StructuredEvidenceItemSchema = z.object({
+  evidence_id: z.string().min(1).optional(),
+  claim_id: z.string().min(1),
+  source_type: z.enum(STRUCTURED_EVIDENCE_SOURCE_TYPES),
+  producer: z.string().min(1),
+  operation_id: z.string().min(1).optional(),
+  target_id: z.string().min(1).optional(),
+  exit_code: z.number().int().optional(),
+  raw_output: z.string().min(1),
+});
+
 const PROCESS_VERDICT_RULE_PREFIXES = [
   "PENDING_REJECT",
   "ACTIVE_ALERT_COMPLETION",
@@ -2088,8 +2336,8 @@ const PROCESS_VERDICT_RULE_PREFIXES = [
   "INVARIANT#19_MCP_TRIGGER_BYPASS",
   "INVARIANT#25_SKILL_FIRST_REQUIRED",
   "INVARIANT#27_GUARD_BLAME_SHIFT",
-  "INVARIANT#29_CLOSEOUT_PROTOCOL_SKIPPED",
   "INVARIANT#39_OPENCRAB_9SPACE_PREWRITE",
+  "INVARIANT#41_INTENT_MISMATCH_EXECUTED",
 ];
 
 function isProcessVerdictRule(rule: string): boolean {
@@ -2112,15 +2360,27 @@ export function registerGuardrailTools(server: McpServer) {
       tool_call_log: z.string().optional().describe("Concatenated JSON or text of this turn's tool calls (args + outputs). Used to verify backtick paths and script citations."),
       claimed_items: z.array(z.string()).optional().describe("Discrete completion claims, if any"),
       evidence_outputs: z.array(z.string()).optional().describe("Raw tool stdout for each claimed_item (1:1 with claimed_items). Must be raw — not narrative summaries."),
+      claims: z.array(StructuredClaimSchema).optional().describe("Structured completion claims with stable claim_id values. Use with evidence_items for explicit correlation."),
+      evidence_items: z.array(StructuredEvidenceItemSchema).optional().describe("Typed raw evidence bound by claim_id. Playwright DOM is corroborating only and must share operation_id with strong process/API/tool evidence."),
       risk_tier: z.enum(COMPLETION_RISK_TIERS).optional().describe("Completion risk tier. external_write keeps strict user-facing evidence; local_code/docs/commit accept normal local engineering evidence such as tests, diff checks, git status, and commit hashes."),
       session_id: z.string().optional().describe("Session identifier for pending-state isolation. When omitted, falls back to HARNESS_SESSION_ID env (auto-bootstrapped to `auto-<pid>-<ts>` at server start if unset). Pass the Antigravity conversation/trace id explicitly when running concurrent IDE windows so their pending state can't collide."),
     },
-    async ({ response_text, user_request, tool_call_log, claimed_items, evidence_outputs, risk_tier, session_id }) => {
+    async ({ response_text, user_request, tool_call_log, claimed_items, evidence_outputs, claims, evidence_items, risk_tier, session_id }) => {
       const log = tool_call_log ?? "";
       const sid = session_id ?? DEFAULT_SESSION_ID;
       const riskTier = normalizeCompletionRiskTier(risk_tier);
       const currentClaimHash = claimScopeHash(response_text);
-      const currentEvidenceHash = evidenceHash(log, evidence_outputs ?? []);
+      const evidenceHashInputs = [...(evidence_outputs ?? [])];
+      if (claims && claims.length > 0) evidenceHashInputs.push(JSON.stringify(claims));
+      if (evidence_items && evidence_items.length > 0) {
+        evidenceHashInputs.push(JSON.stringify(evidence_items));
+      }
+      const currentEvidenceHash = evidenceHash(log, evidenceHashInputs);
+      const evidenceCorrelation = correlateStructuredEvidence(
+        claims ?? [],
+        evidence_items ?? [],
+        riskTier,
+      );
       const pendingAtStart = loadSessionPending(sid);
       const violations = scanText(response_text, log, riskTier);
       const processWarnings: { rule: string; matched: string; description: string }[] = [];
@@ -2139,31 +2399,12 @@ export function registerGuardrailTools(server: McpServer) {
       // pending state. Without this, skill-trigger detection silently degrades
       // when the triggering keyword only appears in the original user message.
       const effectiveUserRequest = (user_request ?? "").trim() || (pendingAtStart?.last_user_request ?? "");
-      const skillTriggers = detectSkillTriggers(`${effectiveUserRequest}\n${response_text}`);
-
-      // INVARIANT#29_CLOSEOUT_PROTOCOL_SKIPPED (2026-06-08 추가)
-      // user_request에 종료 키워드가 있는데 tool_call_log에 run_session_end.py 증거가 없으면 CRITICAL.
-      const CLOSEOUT_TRIGGER_RE29 = /(?:^|[\s,.])(세션\s*종료|종료|session\s*close|archive-first\s*closeout|wrap\s*up|exit\s*session)(?:[\s,.!?]|$)/i;
-      const CLOSEOUT_NEG_RE29 = /(파일|프로세스|process|task|탭|tab|창|window|터미널|terminal|연결|connection|서버|server|컨테이너|container)\s*(종료|close|끝)/i;
-      const SESSION_END_EVIDENCE_RE29 = /run_session_end\.py|"timestamp"\s*:\s*"202|"trace_id"\s*:|"scores"\s*:/i;
-      if (
-        user_request &&
-        CLOSEOUT_TRIGGER_RE29.test(user_request) &&
-        !CLOSEOUT_NEG_RE29.test(user_request) &&
-        !SESSION_END_EVIDENCE_RE29.test(log) &&
-        !SESSION_END_EVIDENCE_RE29.test(response_text)
-      ) {
-        violations.push({
-          rule: "INVARIANT#29_CLOSEOUT_PROTOCOL_SKIPPED",
-          severity: "CRITICAL",
-          matched: user_request.slice(0, 80),
-          description:
-            "사용자가 '종료' 명령을 내렸으나 tool_call_log에 run_session_end.py 실행 증거가 없습니다. " +
-            "GEMINI.md Closeout 룰에 따라 반드시 `python run_session_end.py --session-title \"<title>\" ...`를 실행하고 " +
-            "그 JSON stdout과 quality_check.py 스코어를 응답에 인용해야 합니다. " +
-            "단순 텍스트로 '종료합니다'만 답하는 것은 프로토콜 위반입니다.",
-        });
-      }
+      // Skill-first routing represents user intent. Scanning the draft response
+      // caused incidental product names in evidence/closeout text to be treated
+      // as new user requests (for example, an OpenCrab version in release notes).
+      const skillTriggers = detectSkillTriggers(effectiveUserRequest);
+      // INVARIANT#41 (P1-2): 게이트를 건너뛰고 이미 실행된 파괴 명령의 의도 불일치 사후 적발.
+      violations.push(...scanIntentMismatchExecuted(effectiveUserRequest, log, sid));
 
       // BUG FIX (2026-06-18): When the model correctly responds with STATUS: PARTIAL_STATUS
       // that satisfies isPartialStatusRewrite(), do NOT add PENDING_REJECT violation even if
@@ -2228,6 +2469,11 @@ export function registerGuardrailTools(server: McpServer) {
       while ((m = scriptRe.exec(response_text)) !== null) {
         if (seen.size >= PHANTOM_SCAN_LIMIT) break;
         const filename = path.basename(m[1]);
+        if (isNegatedScriptCitation(response_text, m.index, m.index + m[0].length)) continue;
+        if (
+          evidenceCorrelation.all_verified &&
+          isVerifiedArtifactReadbackCitation(response_text, m.index, m.index + m[0].length)
+        ) continue;
         if (seen.has(filename)) continue;
         seen.add(filename);
         if (log.includes(filename)) continue; // touched in this turn
@@ -2471,15 +2717,84 @@ export function registerGuardrailTools(server: McpServer) {
       const weakClaims: string[] = [];
       items.forEach((c, idx) => {
         const e = evid[idx] ?? "";
-        if (!evidenceIsStrong(e, riskTier)) weakClaims.push(`#${idx + 1}: ${c.slice(0, 60)}`);
+        if (!evidenceIsStrongForClaim(e, c, riskTier)) weakClaims.push(`#${idx + 1}: ${c.slice(0, 60)}`);
       });
       if (weakClaims.length > 0) {
         violations.push({
           rule: "WEAK_EVIDENCE",
           severity: "HIGH",
           matched: weakClaims.slice(0, 5).join("; "),
-          description: "Each claimed completion item requires raw stdout/diff/Read excerpt — not narrative.",
+          description:
+            "Each claim requires raw machine evidence matching its polarity: success evidence for completed claims, failure/block/unresolved evidence for explicit negative claims — not narrative.",
         });
+      }
+
+      // claimed_items/evidence_outputs already provide a 1:1, polarity-aware
+      // evidence contract. Once every item passes that contract, requiring the
+      // same stdout again in response_text adds formatting work without adding
+      // verification strength. Keep the inline rule for unbound tool logs.
+      const legacyEvidenceAllVerified =
+        riskTier !== "external_write" &&
+        items.length > 0 &&
+        items.length === evid.length &&
+        weakClaims.length === 0;
+      if (legacyEvidenceAllVerified) {
+        for (let idx = violations.length - 1; idx >= 0; idx--) {
+          if (
+            violations[idx].rule === "INVARIANT#12" ||
+            violations[idx].rule === "INVARIANT#12_EVIDENCE_NOT_INLINE"
+          ) {
+            violations.splice(idx, 1);
+          }
+        }
+      }
+
+      // Structured evidence is a first-class alternative to repeating raw logs
+      // inside response_text. A claim passes only when a strong primary
+      // process/API/tool result exists. Browser DOM can corroborate that result
+      // when claim_id + operation_id (+ target_id when supplied) agree and the
+      // extracted facts do not conflict. Legacy claimed_items/evidence_outputs
+      // use the same no-repeat rule above.
+      if (evidenceCorrelation.enabled) {
+        if (evidenceCorrelation.all_verified) {
+          for (let idx = violations.length - 1; idx >= 0; idx--) {
+            if (
+              violations[idx].rule === "INVARIANT#12" ||
+              violations[idx].rule === "INVARIANT#12_EVIDENCE_NOT_INLINE"
+            ) {
+              violations.splice(idx, 1);
+            }
+          }
+        } else {
+          const correlationErrors = [
+            ...evidenceCorrelation.errors,
+            ...evidenceCorrelation.claims.flatMap((claim) =>
+              claim.errors.map((error) => `${claim.claim_id}:${error}`),
+            ),
+          ];
+          const mismatches = correlationErrors.filter((error) =>
+            /(?:duplicate_claim_id|unknown_claim_id|operation_id_mismatch|target_id_mismatch|fact_mismatch)/.test(error),
+          );
+          const weak = correlationErrors.filter((error) => !mismatches.includes(error));
+          if (mismatches.length > 0) {
+            violations.push({
+              rule: "EVIDENCE_CORRELATION_MISMATCH",
+              severity: "CRITICAL",
+              matched: mismatches.slice(0, 5).join("; "),
+              description:
+                "Structured evidence refers to different operations/targets or reports conflicting result facts. Correlated evidence must describe the same execution.",
+            });
+          }
+          if (weak.length > 0) {
+            violations.push({
+              rule: "EVIDENCE_CORRELATION_WEAK",
+              severity: "HIGH",
+              matched: weak.slice(0, 5).join("; "),
+              description:
+                "Structured claims require strong primary process/API/tool evidence. Playwright DOM or human summaries cannot prove the underlying result alone.",
+            });
+          }
+        }
       }
 
       // 2026-07-12 audit (P0-2/P0-3): the former "Bug#2" narrative-only INVARIANT#12
@@ -2603,7 +2918,9 @@ export function registerGuardrailTools(server: McpServer) {
         ? `🔄 자동 재시도 모드 — 사용자에게 예/아니오를 묻지 마세요. ` +
           `드래프트를 그대로 emit하지 말고, 감지된 위반(${blocked_summary})을 직접 수정하세요. ` +
           `claimed_items별로 raw stdout/diff/Read 발췌를 evidence_outputs[i]로 첨부하고 ` +
-          `(각 ≥20자, 'exit 0'·'lines'·'bytes'·'PASS' 같은 토큰 포함), honest_check를 정확히 한 번 더 ` +
+          `(각 ≥20자; 완료 주장은 'exit 0'·'lines'·'bytes'·'PASS' 같은 양성 토큰, ` +
+          `실패·차단·미완료 주장은 status=blocked/failed·비영 종료 코드·false readiness·미해결 개수 같은 음성 토큰), ` +
+          `음성 주장에 PASS/exit 0을 지어내지 말고 honest_check를 정확히 한 번 더 ` +
           `호출하세요. HONEST가 나올 때까지 사용자 개입 없이 스스로 보강·재시도합니다 ` +
           `(claim ${retry_count}/${RETRY_LIMIT}, session ${session_block_count}/${SESSION_BLOCK_LIMIT}). ` +
           `다른 도구로 우회하거나 주장 문장만 바꿔 다시 호출하는 것은 금지입니다.`
@@ -2738,6 +3055,7 @@ export function registerGuardrailTools(server: McpServer) {
                 session_block_window_min: SESSION_BLOCK_WINDOW_MIN,
                 claim_hash: currentClaimHash,
                 evidence_hash: currentEvidenceHash,
+                evidence_correlation: evidenceCorrelation,
                 session_id: sid,
                 state_persisted,
                 state_error,
@@ -2949,24 +3267,12 @@ export function registerGuardrailTools(server: McpServer) {
 
       // (2026-05-31) 사용자에게 예/아니오를 묻는 confirmation 핸드셰이크를 제거했다.
       // honest_check가 자동 재시도→자동 분해를 처리하므로, 여기서는 사용자 답을
-      // approve/reject/ambiguous 로 해석하지 않는다. 남는 라우팅은 두 가지뿐:
-      //   - session_close: 세션 종료 의도 → pending flush + 종료 프로토콜
+      // approve/reject/ambiguous 로 해석하지 않는다. 남는 특수 라우팅은 하나뿐:
       //   - resume_partial_status: 이전 턴의 자동 분해(force_partial_status)가 아직
       //     닫히지 않음 → 사용자 답과 무관하게 PARTIAL_STATUS 분해를 이어가도록 지시
-      let intent:
-        | "session_close"
-        | "resume_partial_status"
-        | "continue" = "continue";
-      let flushed_pending = false;
+      let intent: "resume_partial_status" | "continue" = "continue";
 
-      const sessionCloseHit = SESSION_CLOSE_RE.test(text) && !SESSION_CLOSE_NEG_RE.test(text);
-      if (sessionCloseHit) {
-        intent = "session_close";
-        if (pending) {
-          clearSessionPending(sid);
-          flushed_pending = true;
-        }
-      } else if (pending?.force_partial_status) {
+      if (pending?.force_partial_status) {
         // 이전 턴에서 honest_check 재시도 한도를 소진해 자동 PARTIAL_STATUS 분해가
         // 강제됐고 아직 닫히지 않았다. 사용자 답을 기다리지 말고 모델이 곧바로
         // PARTIAL_STATUS 분해를 이어가도록 라우팅한다. 모델이 제대로 된 PARTIAL_STATUS를
@@ -2987,10 +3293,13 @@ export function registerGuardrailTools(server: McpServer) {
       // but skip if it's clearly an educational/explain context — "DROP TABLE
       // 이 왜 위험한지 설명해줘" should NOT trigger destructive_db.
       const risk_signals: { rule: string; reason: string; matched: string }[] = [];
-      // draft_action = explicit execution intent → scan as-is. Without it, fall
-      // back to the user message but strip code/quote/comment noise first (#9)
-      // so a destructive command shown as documentation isn't treated as intent.
-      const riskHaystack = draft_action ?? stripRiskNoise(text);
+      // draft_action = explicit execution intent → scan after stripping known
+      // data-sink arguments (P1-1: commit-message bodies / echo payloads are data,
+      // not commands — this session's real incident false-fired on a commit message
+      // documenting a destructive command). Without draft_action, fall back to the
+      // user message but strip code/quote/comment noise first (#9) so a destructive
+      // command shown as documentation isn't treated as intent.
+      const riskHaystack = draft_action ? stripDataSinkArgs(draft_action) : stripRiskNoise(text);
       const isEducational = !draft_action && NON_EXECUTION_CONTEXT_RE.test(text);
       if (!isEducational) {
         for (const r of RISK_PATTERNS) {
@@ -3017,6 +3326,33 @@ export function registerGuardrailTools(server: McpServer) {
         }
       }
 
+      // INTENT MISMATCH GATE — draft_action(명시적 실행 의도)에 destructive_* 가
+      // 잡혔는데 사용자의 직전 메시지에는 파괴 동사가 하나도 없음 → 승인 요청
+      // 단계로 보내지 않고 절대 차단. draft_action 이 없으면 riskHaystack 이
+      // user_request 자체이므로(사용자가 직접 파괴 명령을 타이핑) 불일치가 성립
+      // 하지 않는다.
+      //
+      // P1-3: 직전 15분 내 같은 세션에서 사용자가 파괴 동사를 말했다면(승인 흐름:
+      // "삭제해줘" → 모델이 계획 제시 → "응 진행해") 절대 차단을 통상 승인 게이트로
+      // 강등한다. destructive_* 신호·승인 요구 instructions 는 유지된다.
+      const userDestructiveMatch = stripCodeAndQuotes(text).match(DESTRUCTIVE_INTENT_RE);
+      if (userDestructiveMatch) saveDestructiveIntent(sid, userDestructiveMatch[0]);
+      const destructiveDraftSignals = risk_signals.filter((r) => r.rule.startsWith("destructive_"));
+      const mismatchCandidate =
+        !!draft_action && destructiveDraftSignals.length > 0 && !userDestructiveMatch;
+      const recentDestructiveIntent = mismatchCandidate ? loadDestructiveIntent(sid) : null;
+      const intent_mismatch_block = mismatchCandidate && !recentDestructiveIntent;
+      const intent_mismatch_suppressed_by =
+        mismatchCandidate && recentDestructiveIntent ? recentDestructiveIntent.ts : null;
+      if (intent_mismatch_block) {
+        risk_signals.unshift({
+          rule: "INTENT_MISMATCH_DESTRUCTIVE",
+          reason:
+            "INTENT MISMATCH: user_request contains no destructive verb (삭제/wipe/purge/초기화/drop …) but draft_action is a destructive command. The model has very likely misread the user's intent — do NOT execute.",
+          matched: destructiveDraftSignals[0].matched,
+        });
+      }
+
       const skillFirstInstruction =
         skill_triggers.length > 0
           ? "SKILL-FIRST required: before executing commands, editing files, or drafting a completion claim, read the matching SKILL.md file(s): " +
@@ -3027,15 +3363,7 @@ export function registerGuardrailTools(server: McpServer) {
           : "";
 
       let instructions: string;
-      if (intent === "session_close") {
-        instructions =
-          "User signaled session close. SKIP honest_check evidence-blocking for this turn. " +
-          "Execute the session-end protocol per CLAUDE.md: AAAK-L digest → mission update → Edit Safety → " +
-          "Knowledge Maturity → Hermes Skill auto-gen → MCP cleanup → OpenCrab daily ingest. " +
-          (flushed_pending
-            ? "A pending honest_check block was auto-flushed because the user moved on."
-            : "No pending block to flush.");
-      } else if (intent === "resume_partial_status") {
+      if (intent === "resume_partial_status") {
         const ageHint =
           pending_age_seconds !== null ? ` (open for ~${pending_age_seconds}s)` : "";
         instructions =
@@ -3078,6 +3406,33 @@ export function registerGuardrailTools(server: McpServer) {
           instructions;
       }
 
+      // 삭제류 파괴 작업 soft-delete 정책 (2026-07-17 사용자 지시): 하드 삭제 대신
+      // C:\tmp 이동을 기본 대안으로 안내한다. 모든 destructive 게이트 분기에 공통 적용.
+      if (risk_signals.length > 0) {
+        instructions +=
+          ` 파일/디렉터리 삭제는 하드 삭제(Remove-Item/rm) 대신 ${SOFT_DELETE_DIR} 로 이동(soft-delete)하는 것이 표준 정책입니다 — 사용자가 명시적으로 완전 삭제를 요구한 경우에만 실제 삭제하세요.`;
+      }
+
+      // INTENT MISMATCH 절대 차단 — 마지막에 prepend 하여 어떤 안내보다도 앞에 온다.
+      if (intent_mismatch_block) {
+        instructions =
+          `🚫 INTENT MISMATCH GATE — 절대 차단: 사용자의 직전 메시지에 파괴적 동사(삭제/정리/초기화/drop 등)가 없는데 ` +
+          `draft_action 이 파괴적 명령(${destructiveDraftSignals.map((r) => r.rule).join(", ")})입니다. ` +
+          `사용자 의도를 잘못 해석했을 가능성이 매우 높으므로 이 명령을 실행하지 마세요. ` +
+          `삭제가 목적이라면 실제 삭제 대신 ${SOFT_DELETE_DIR} 로 이동(soft-delete)하고, 그 외 파괴 작업이 정말 필요하면 ` +
+          `명령 원문·영향·복구 가능성을 사용자에게 보여주고 파괴 작업임을 명시한 승인을 먼저 받으세요. ` +
+          instructions;
+      }
+
+      // P2-4: 게이트 정밀도 측정용 관측성 로그.
+      logIntentCheckCall(
+        sid,
+        intent,
+        risk_signals.map((r) => r.rule),
+        intent_mismatch_block,
+        intent_mismatch_suppressed_by,
+      );
+
       return {
         content: [
           {
@@ -3086,6 +3441,8 @@ export function registerGuardrailTools(server: McpServer) {
               {
                 intent,
                 risk_signals,
+                intent_mismatch_block,
+                intent_mismatch_suppressed_by,
                 pending_confirmation_was_active: pending !== null,
                 pending_reason: pending?.reason ?? null,
                 pending_created_at: pending?.created_at ?? null,
@@ -3093,7 +3450,6 @@ export function registerGuardrailTools(server: McpServer) {
                 pending_age_seconds,
                 pending_claim_hash: pending?.claim_hash ?? null,
                 session_id: sid,
-                flushed_pending,
                 skill_triggers,
                 skill_first_required: skill_triggers.length > 0,
                 delegated_verification_tools,
@@ -3130,15 +3486,31 @@ export function registerGuardrailTools(server: McpServer) {
     {
       session_id: z.string().optional().describe("Session id to scope the audit. Defaults to HARNESS_SESSION_ID env or 'default'."),
       window_minutes: z.number().optional().describe("Look back this many minutes when counting recent honest_check calls (default 5)."),
+      response_text: z.string().optional().describe("Current draft response. Required for explicit external_write and destructive_local audits so only an honest_check result for this claim scope satisfies the gate."),
+      risk_tier: z.enum(COMPLETION_RISK_TIERS).optional().describe("Completion risk tier. external_write and destructive_local require current-draft honest_check; local_code, docs, and commit may use normal local engineering evidence without it."),
     },
-    async ({ session_id, window_minutes }) => {
+    async ({ session_id, window_minutes, response_text, risk_tier }) => {
       const sid = session_id || DEFAULT_SESSION_ID;
       const win = typeof window_minutes === "number" && window_minutes > 0 ? window_minutes : 5;
+      const riskTier = normalizeCompletionRiskTier(risk_tier);
+      const honestCheckRequired = !isLocalCompletionTier(riskTier);
+      const currentDraftBindingRequired =
+        riskTier === "external_write" || riskTier === "destructive_local";
       const calls = readRecentHonestCalls(sid, win);
-      const honestCount = calls.filter((c) => c.verdict === "HONEST").length;
-      const nonHonest = calls.length - honestCount;
+      const currentDraftHash = response_text ? claimScopeHash(response_text) : null;
+      const currentDraftCalls = currentDraftHash
+        ? calls.filter((call) => call.claim_hash === currentDraftHash)
+        : calls;
+      const auditedCalls = currentDraftHash ? currentDraftCalls : calls;
+      const honestCount = auditedCalls.filter((c) => c.verdict === "HONEST").length;
+      const nonHonest = auditedCalls.length - honestCount;
 
-      let verdict: "OK" | "MISSING_HONEST_CHECK" | "RECENT_VIOLATIONS";
+      let verdict:
+        | "OK"
+        | "NOT_REQUIRED"
+        | "MISSING_HONEST_CHECK"
+        | "MISSING_CURRENT_DRAFT_CHECK"
+        | "RECENT_VIOLATIONS";
       let reason: string;
       // (2026-07-12 P1-2) session_emit_audit no longer emits a user-facing 예/아니오
       // prompt. Per the 2026-05-31 decision (see honest_check), the harness never
@@ -3149,22 +3521,44 @@ export function registerGuardrailTools(server: McpServer) {
       const needs_user_confirmation = false;
       const confirmation_question: string | null = null;
 
-      if (calls.length === 0) {
+      if (!honestCheckRequired && auditedCalls.length === 0) {
+        verdict = "NOT_REQUIRED";
+        reason =
+          `risk_tier='${riskTier}'는 로컬 엔지니어링 증거로 완료를 보고할 수 있어 ` +
+          "honest_check가 필수가 아닙니다.";
+      } else if (calls.length === 0) {
         verdict = "MISSING_HONEST_CHECK";
         reason = `세션 '${sid}'에 최근 ${win}분 내 honest_check 호출 0건. 응답 emit 전 반드시 honest_check를 먼저 호출하세요.`;
+      } else if (
+        (currentDraftBindingRequired && !currentDraftHash) ||
+        (currentDraftHash && currentDraftCalls.length === 0)
+      ) {
+        verdict = "MISSING_CURRENT_DRAFT_CHECK";
+        reason =
+          currentDraftHash
+            ? `세션 '${sid}'에 최근 ${win}분 내 honest_check 호출은 있지만 현재 드래프트의 claim scope와 ` +
+              "일치하는 호출이 없습니다."
+            : `risk_tier='${riskTier}' 감사에는 현재 response_text가 필요합니다. 과거 HONEST 호출만으로는 ` +
+              "현재 완료 주장을 검증할 수 없습니다.";
       } else if (nonHonest > 0) {
         verdict = "RECENT_VIOLATIONS";
-        reason = `세션 '${sid}' 최근 ${win}분 호출 ${calls.length}건 중 ${nonHonest}건이 HONEST가 아님.`;
+        reason = `세션 '${sid}' 최근 ${win}분 감사 대상 호출 ${auditedCalls.length}건 중 ${nonHonest}건이 HONEST가 아님.`;
       } else {
         verdict = "OK";
-        reason = `세션 '${sid}' 최근 ${win}분 honest_check ${honestCount}건 모두 HONEST 통과.`;
+        reason = `세션 '${sid}' 최근 ${win}분 감사 대상 honest_check ${honestCount}건 모두 HONEST 통과.`;
       }
 
       const instructions =
         verdict === "MISSING_HONEST_CHECK"
-          ? "Call honest_check with the draft response_text immediately before emitting. Do not bypass this gate even for trivial-looking responses."
+          ? "Call honest_check with the draft response_text before emitting this strict-risk completion claim."
+          : verdict === "MISSING_CURRENT_DRAFT_CHECK"
+          ? "Call honest_check with this exact draft response_text. A prior result for another claim does not satisfy the current completion gate."
           : verdict === "RECENT_VIOLATIONS"
           ? "Recent honest_check verdicts include non-HONEST entries. Investigate the latest violation before re-emitting."
+          : verdict === "NOT_REQUIRED"
+          ? "Use focused tests, diff checks, file readback, or commit evidence appropriate to the local task."
+          : currentDraftHash
+          ? "The current draft claim scope has a clean honest_check result."
           : "Recent honest_check chain is clean. Safe to emit if current draft also passes honest_check.";
 
       return {
@@ -3177,9 +3571,16 @@ export function registerGuardrailTools(server: McpServer) {
                 reason,
                 session_id: sid,
                 window_minutes: win,
+                risk_tier: riskTier,
+                honest_check_required: honestCheckRequired,
+                current_draft_binding_required: currentDraftBindingRequired,
                 recent_call_count: calls.length,
                 honest_count: honestCount,
                 non_honest_count: nonHonest,
+                current_draft_claim_hash: currentDraftHash,
+                current_draft_match_count: currentDraftCalls.length,
+                current_draft_non_honest_count:
+                  currentDraftCalls.length - currentDraftCalls.filter((c) => c.verdict === "HONEST").length,
                 recent_calls: calls.slice(-10),
                 needs_user_confirmation,
                 confirmation_question,

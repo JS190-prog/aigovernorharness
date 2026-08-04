@@ -17,6 +17,10 @@ Thumbs.db
 # Runtime / harness state (written at runtime, not source)
 *.lock
 tmp/
+runtime/state/*.jsonl*
+runtime/state/*.json
+runtime/state/migration-manifest.json
+runtime/state/migrated_sources/
 
 # Python bytecode cache (e.g. from running the pack_audit fixture)
 __pycache__/

@@ -16,12 +16,15 @@ const outDir = path.resolve(process.argv[2] ?? "ci-fixtures");
 // Skills the regression suite treats as "really installed" (must have SKILL.md):
 //   codex-natural, crab                       → 11a/11f corroboration
 //   hermes-audio-transcriber                  → 13a/13b/13d/13d2 skill-first
+//   hermes-mcp-orchestrator, hermes-cad-expert → 13b4/13b5 route disambiguation
 //   hermes-naver-publish, hermes-blog-verify,
 //   hermes-illustration-expert                → supplement-route triggers (17x)
 const SKILLS = [
   "codex-natural",
   "crab",
   "hermes-audio-transcriber",
+  "hermes-mcp-orchestrator",
+  "hermes-cad-expert",
   "hermes-naver-publish",
   "hermes-blog-verify",
   "hermes-illustration-expert",
@@ -33,6 +36,10 @@ const ROUTES = [
   {
     keywords: ["전사", "녹음 전사", "회의 녹음", "회의 녹음 전사"],
     skills: ["hermes-audio-transcriber"],
+  },
+  {
+    keywords: ["cad", "캐드", "도면 분석", "dwg", "dxf", "오토캐드", "건축 도면"],
+    skills: ["hermes-mcp-orchestrator", "hermes-cad-expert"],
   },
 ];
 

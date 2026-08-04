@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
+import { installLifecycleDiagnostics, markStdioConnected } from "./lifecycle.js";
 
 // Single source of truth for the version: read it from package.json at runtime
 // (build/index.js → ../package.json = repo root) instead of hardcoding it in
@@ -17,6 +18,8 @@ if (!process.env.HARNESS_SESSION_ID || process.env.HARNESS_SESSION_ID === "defau
   );
 }
 
+installLifecycleDiagnostics();
+
 const { registerGuardrailTools } = await import("./tools/guardrail.js");
 const { registerSpecPackTools } = await import("./tools/spec_pack_audit.js");
 
@@ -31,6 +34,7 @@ registerSpecPackTools(server);
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  markStdioConnected();
   console.error(
     `AI-Governor-Harness MCP server v${HARNESS_VERSION} running on stdio ` +
       `(session_id=${process.env.HARNESS_SESSION_ID})`,

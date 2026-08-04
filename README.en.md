@@ -17,7 +17,12 @@ environments.
 - `chain_progress_check` catches unnecessary stop-and-ask behavior during
   multi-step work.
 - `turn_intent_check` classifies sensitive, destructive, delegated, or
-  skill-routed requests before action.
+  skill-routed requests before action. When a destructive `draft_action` is
+  detected but the user's message carries no destructive verb, the INTENT
+  MISMATCH GATE hard-blocks it (`intent_mismatch_block`); deletions are steered
+  to a soft-delete move (configurable via `HARNESS_SOFT_DELETE_DIR`) instead of
+  hard deletion. `honest_check` audits the same mismatch post-hoc
+  (INVARIANT#41) when a destructive command was already executed.
 - `session_emit_audit` checks that recent final-response verification was not
   skipped.
 - `spec_pack_audit` calls an external pack-audit script to validate upload-ready

@@ -274,17 +274,7 @@ try {
     "direct Neo4j node/edge lineage evidence should not trigger OpenCrab Neo4j lineage violation",
   );
 
-  // 8) turn_intent_check — session_close detection (must flush pending state
-  //     that bareClaim just created)
-  const sessionClose = parseToolJson(
-    await client.callTool({
-      name: "turn_intent_check",
-      arguments: { user_request: "종료" },
-    }),
-  );
-  assert.equal(sessionClose.intent, "session_close");
-
-  // 9) turn_intent_check — risk signal detection
+  // 8) turn_intent_check — risk signal detection
   const riskCheck = parseToolJson(
     await client.callTool({
       name: "turn_intent_check",
@@ -296,7 +286,7 @@ try {
     "should detect destructive_docker",
   );
 
-  // 10) turn_intent_check — neutral turn
+  // 9) turn_intent_check — neutral turn
   const neutral = parseToolJson(
     await client.callTool({
       name: "turn_intent_check",
@@ -304,6 +294,14 @@ try {
     }),
   );
   assert.equal(neutral.intent, "continue");
+
+  const closeoutRemoval = parseToolJson(
+    await client.callTool({
+      name: "turn_intent_check",
+      arguments: { user_request: "종료 룰에 따른 종료 기능을 제거해줘" },
+    }),
+  );
+  assert.equal(closeoutRemoval.intent, "continue");
 
   // 11) chain_progress_check — stop-and-ask in draft is detected
   const chainStop = parseToolJson(
@@ -419,9 +417,9 @@ try {
     weak: weak.verdict,
     flashFreeze: stopAndAskCheck.verdict,
   }, intents: {
-    sessionClose: sessionClose.intent,
     risk: riskCheck.risk_signals.map((r) => r.rule),
     neutral: neutral.intent,
+    closeoutRemoval: closeoutRemoval.intent,
   }, chain: {
     stopDetected: chainStop.stop_and_ask_detected.length,
     hangRisks: chainHang.hang_risk_signals.map((h) => h.risk),

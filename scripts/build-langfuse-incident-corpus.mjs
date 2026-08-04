@@ -70,11 +70,6 @@ const RULE_PATTERNS = [
     pattern: /(Set-Variable[\s\S]{0,120}\beuo\b|NamedParameterNotFound|ParameterBindingException|UnexpectedToken|ParserError|set\s+-euo\s+pipefail)/i,
   },
   {
-    rule: "INVARIANT#16_FAKE_SESSION_END",
-    confidence: "candidate",
-    pattern: /(세션\s*종료\s*결산|자동\s*실행기\s*출력|run_session_end)[\s\S]{0,240}["']?status["']?\s*:\s*["']?(Success|Partial|완료)/i,
-  },
-  {
     rule: "INVARIANT#15_PHANTOM_SCRIPT",
     confidence: "candidate",
     pattern: /\b[\w./\\-]+\.(?:py|ps1|sh|mjs|js|bat|cmd)\b[\s\S]{0,80}(실행|통해|사용|ran|run|executed|via|using)|(?:실행|통해|사용|ran|run|executed|via|using)[\s\S]{0,80}\b[\w./\\-]+\.(?:py|ps1|sh|mjs|js|bat|cmd)\b/i,
