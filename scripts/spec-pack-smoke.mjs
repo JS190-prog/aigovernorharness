@@ -133,6 +133,20 @@ try {
     `expected INVARIANT#23 violation. got: ${JSON.stringify(honestNoToken.violations.map((v) => v.rule))}`,
   );
 
+  const honestCiJobName = parse(
+    await client.callTool({
+      name: "honest_check",
+      arguments: {
+        response_text: "GitHub Actions에서 spec-pack, Windows, Ubuntu 세 작업이 모두 성공했습니다.",
+        tool_call_log: "",
+      },
+    }),
+  );
+  assert.ok(
+    !honestCiJobName.violations.some((v) => v.rule === "INVARIANT#23_SPEC_PACK_UNVERIFIED"),
+    `CI job name must not trigger INVARIANT#23. got: ${JSON.stringify(honestCiJobName.violations.map((v) => v.rule))}`,
+  );
+
   // T5) honest_check — recommended_actions must include spec_pack_audit hint
   const acts = honestNoToken.recommended_actions ?? [];
   assert.ok(

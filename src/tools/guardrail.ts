@@ -2219,6 +2219,12 @@ function normalizePathForCompare(s: string): string {
     .toLowerCase();
 }
 
+function specPackMentionIsCiJob(text: string): boolean {
+  const ciContext = /(?:github\s+actions?|\bci\b|workflow|runner|windows|ubuntu|\bjob\b|세\s*작업|작업\s*\d*개)/i;
+  const actualPackContext = /(?:시방서|kcsc|pack_root|upload_dir|payload|metadata_only|\.zip\b|hwp\s*일괄|opencrab\.sh)/i;
+  return ciContext.test(text) && !actualPackContext.test(text);
+}
+
 function scanText(
   text: string,
   toolCallLog: string = "",
@@ -2240,6 +2246,7 @@ function scanText(
 
     if (rule.rule === "INVARIANT#5" && (strongEvidence || partialStatusRewrite)) continue;
     if (rule.rule === "INVARIANT#15_PHANTOM_SCRIPT" && strongEvidence) continue;
+    if (rule.rule === "INVARIANT#23_SPEC_PACK_UNVERIFIED" && specPackMentionIsCiJob(text)) continue;
     if (rule.rule === "INVARIANT#23_SPEC_PACK_UNVERIFIED" && strongEvidence) continue;
 
     violations.push({
